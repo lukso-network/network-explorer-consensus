@@ -64,7 +64,7 @@ func Init(chainId uint64, eth1Endpoint, clCurrencyParam, elCurrencyParam string)
 	}
 
 	switch chainId {
-	case 1, 100:
+	case 1, 100, 42:
 	default:
 		setPrice(elCurrency, elCurrency, 1)
 		setPrice(clCurrency, clCurrency, 1)
