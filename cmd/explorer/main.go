@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"strings"
@@ -28,13 +29,9 @@ import (
 	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 	"github.com/gobitfly/eth2-beaconchain-explorer/version"
 
-	httpSwagger "github.com/swaggo/http-swagger"
-
 	"github.com/sirupsen/logrus"
 
 	_ "net/http/pprof"
-
-	_ "github.com/gobitfly/eth2-beaconchain-explorer/docs"
 
 	"github.com/gorilla/csrf"
 	"github.com/gorilla/mux"
@@ -71,6 +68,7 @@ func main() {
 		fmt.Println(version.GoVersion)
 		return
 	}
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	cfg := &types.Config{}
 	err := utils.ReadConfig(cfg, *configPath)
@@ -258,7 +256,7 @@ func main() {
 		router := mux.NewRouter()
 
 		apiV1Router := router.PathPrefix("/api/v1").Subrouter()
-		router.PathPrefix("/api/v1/docs/").Handler(httpSwagger.WrapHandler)
+		apiV1Router.HandleFunc("/docs", handlers.ApiDocs).Methods("GET")
 		apiV1Router.HandleFunc("/latestState", handlers.ApiLatestState).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/epoch/{epoch}", handlers.ApiEpoch).Methods("GET", "OPTIONS")
 

@@ -1407,7 +1407,7 @@ func isMaliciousToken(symbol string) bool {
 	containsUrls := len(xurls.Relaxed.FindAllString(symbol, -1)) > 0
 	isConfusable := len(confusables.IsConfusable(symbol, false, []string{"LATIN", "COMMON"})) > 0
 	isMixedScript := confusables.IsMixedScript(symbol, nil)
-	return containsUrls || isConfusable || isMixedScript || strings.ToUpper(symbol) == "ETH"
+	return containsUrls || isConfusable || isMixedScript || strings.ToUpper(symbol) == "LYX"
 }
 
 func ReverseSlice[S ~[]E, E any](s S) {

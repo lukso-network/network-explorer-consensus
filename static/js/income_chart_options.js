@@ -57,7 +57,7 @@ function getIncomeChartOptions(clIncomeHistory, elIncomeHistory, title, height) 
         opposite: false,
         labels: {
           formatter: function () {
-            return selectedCurrency === "ETH" ? trimToken(this.value) : trimCurrency(this.value)
+            return selectedCurrency === "LYX" ? trimToken(this.value) : trimCurrency(this.value)
           },
         },
       },

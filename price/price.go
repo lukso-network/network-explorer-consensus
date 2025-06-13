@@ -29,8 +29,8 @@ var pricesMu = &sync.Mutex{}
 var didInit = uint64(0)
 var feeds = map[string]*chainlink_feed.Feed{}
 var calcPairs = map[string]bool{}
-var clCurrency = "ETH"
-var elCurrency = "ETH"
+var clCurrency = "LYX"
+var elCurrency = "LYX"
 
 var currencies = map[string]struct {
 	Symbol string
