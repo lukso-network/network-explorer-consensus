@@ -140,6 +140,12 @@ func Init(chainId uint64, eth1Endpoint, clCurrencyParam, elCurrencyParam string)
 		calcPairs["GNO"] = true
 
 		availableCurrencies = []string{"GNO", "mGNO", "DAI", "ETH", "USD", "EUR", "JPY"}
+	case 42:
+		// see: https://www.diadata.org/blog/post/lukso-partners-with-dia-oracles-mainnet/
+		feedAddrs["LYX/USD"] = "0x3153e4d03Cf97B230fc9c9d0ECCE5b2F0834d130"
+		feedAddrs["EUR/USD"] = "0xbCfD839664B5Ad4D0C0C58db0c716D7a28dCd15E"
+
+		availableCurrencies = []string{"LYX", "USD", "EUR"}
 	default:
 		logger.Fatalf("unsupported chainId %v", chainId)
 	}
