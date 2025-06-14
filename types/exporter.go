@@ -365,7 +365,6 @@ type HistoricEthPrice struct {
 			Czk float64 `json:"czk"`
 			Dkk float64 `json:"dkk"`
 			Eth float64 `json:"eth"`
-			Lyx float64 `json:"lyx"`
 			Eur float64 `json:"eur"`
 			Gbp float64 `json:"gbp"`
 			Hkd float64 `json:"hkd"`
@@ -419,7 +418,6 @@ type HistoricEthPrice struct {
 			Czk float64 `json:"czk"`
 			Dkk float64 `json:"dkk"`
 			Eth float64 `json:"eth"`
-			Lyx float64 `json:"lyx"`
 			Eur float64 `json:"eur"`
 			Gbp float64 `json:"gbp"`
 			Hkd float64 `json:"hkd"`
@@ -473,7 +471,6 @@ type HistoricEthPrice struct {
 			Czk float64 `json:"czk"`
 			Dkk float64 `json:"dkk"`
 			Eth float64 `json:"eth"`
-			Lyx float64 `json:"lyx"`
 			Eur float64 `json:"eur"`
 			Gbp float64 `json:"gbp"`
 			Hkd float64 `json:"hkd"`

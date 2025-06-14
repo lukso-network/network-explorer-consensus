@@ -28,7 +28,6 @@ func WriteHistoricPricesForDay(ts time.Time) error {
 	}
 
 	if historicPrice.MarketData.CurrentPrice.Eth == 0.0 ||
-		historicPrice.MarketData.CurrentPrice.Lyx == 0.0 ||
 		historicPrice.MarketData.CurrentPrice.Eur == 0.0 ||
 		historicPrice.MarketData.CurrentPrice.Usd == 0.0 ||
 		historicPrice.MarketData.CurrentPrice.Rub == 0.0 ||
