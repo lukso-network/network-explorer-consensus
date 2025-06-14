@@ -28,6 +28,7 @@ func WriteHistoricPricesForDay(ts time.Time) error {
 	}
 
 	if historicPrice.MarketData.CurrentPrice.Eth == 0.0 ||
+		historicPrice.MarketData.CurrentPrice.Lyx == 0.0 ||
 		historicPrice.MarketData.CurrentPrice.Eur == 0.0 ||
 		historicPrice.MarketData.CurrentPrice.Usd == 0.0 ||
 		historicPrice.MarketData.CurrentPrice.Rub == 0.0 ||
@@ -108,11 +109,8 @@ func fetchHistoricPrice(ts time.Time) (*types.HistoricEthPrice, error) {
 	logger.Infof("fetching historic prices for day %v", ts)
 	client := &http.Client{Timeout: time.Second * 10}
 
-	chain := "ethereum"
+	chain := "lukso-token-2"
 
-	if utils.Config.Chain.Name == "gnosis" {
-		chain = "gnosis"
-	}
 	resp, err := client.Get(fmt.Sprintf("https://api.coingecko.com/api/v3/coins/%s/history?date=%s", chain, ts.Truncate(utils.Day).Format("02-01-2006")))
 
 	if err != nil {
