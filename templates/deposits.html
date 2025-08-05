@@ -22,7 +22,7 @@
               stateLoadCallback: function (settings) {
                 return JSON.parse(localStorage.getItem("DataTables_" + settings.sInstance))
               },
-              order: [[6, 'desc']],
+              order: [[5, 'desc']],
               searching: true,
               ajax: dataTableLoader('/validators/initiated-deposits/data'),
               pagingType: 'input',
@@ -43,7 +43,17 @@
                       previous: '<i class="fas fa-chevron-left"></i>',
                       next: '<i class="fas fa-chevron-right"></i>'
                   }
-              }
+              },
+              columnDefs: [
+                { orderable: false, targets: 0 },
+                { orderable: false, targets: 1 },
+                { orderable: false, targets: 2 },
+                { orderable: false, targets: 3 },
+                { orderable: false, targets: 4 },
+                { orderable: true, targets: 5 },
+                { orderable: false, targets: 6 },
+                { orderable: false, targets: 7 },
+              ],
             })
           {{end}}
           var tblIncluded = $("#included-deposits").DataTable({
@@ -75,8 +85,12 @@
               $('[data-toggle="tooltip"]').tooltip()
             },
             columnDefs: [
+              { orderable: true, targets: 0 },
+              { orderable: false, targets: 1 },
+              { orderable: false, targets: 2 },
               {
                 targets: 3,
+                orderable: false,
                 data: "3",
                 render: function (data, type, row, meta) {
                   // make the span we get from the backend into a DOM element and extract the text value from it (because clipboard text takes only string, not HTML elements)
@@ -84,11 +98,15 @@
                   if (clipboardtext.startsWith("0x01")) {
                     data = `<a href="/address/${clipboardtext.replace("010000000000000000000000", "")}">${data}</a>`
                   }
+                  if (clipboardtext.startsWith("0x02")) {
+                    data = `<a href="/address/${clipboardtext.replace("020000000000000000000000", "")}">${data}</a>`
+                  }
                   return `${data}<i class="fa fa-copy text-muted ml-2 p-1" role="button" data-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="${clipboardtext}"></i>`
                 },
               },
               {
                 targets: 4,
+                orderable: false,
                 data: "4",
                 render: function (data, type, row, meta) {
                   const clipboardtext = $(row[6]).text()
@@ -232,14 +250,13 @@
                   <th>Time</th>
                   <th>Block</th>
                   <th>Validator State</th>
-                  <th>Valid Signature</th>
                 </tr>
               </thead>
               <tbody>
                 {{ if len .DepositContract }}
                 {{ else }}
                   <tr>
-                    <td colspan="8">Waiting for Deposit Contract</td>
+                    <td colspan="7">Waiting for Deposit Contract</td>
                   </tr>
                 {{ end }}
               </tbody>
