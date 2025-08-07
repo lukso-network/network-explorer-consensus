@@ -29,6 +29,10 @@ func Eth1Block(w http.ResponseWriter, r *http.Request) {
 		"slot/attesterSlashing.html",
 		"slot/proposerSlashing.html",
 		"slot/exits.html",
+		"slot/consolidationRequests.html",
+		"slot/compoundingRequests.html",
+		"slot/withdrawalRequests.html",
+		"slot/depositRequests.html",
 		"components/timestamp.html",
 		"slot/overview.html",
 		"slot/execTransactions.html",
@@ -126,7 +130,7 @@ func Eth1Block(w http.ResponseWriter, r *http.Request) {
 func GetExecutionBlockPageData(number uint64, limit int) (*types.Eth1BlockPageData, error) {
 	block, err := db.BigtableClient.GetBlockFromBlocksTable(number)
 	if diffToHead := int64(services.LatestEth1BlockNumber()) - int64(number); err != nil && diffToHead < 0 && diffToHead >= -5 {
-		block, _, err = rpc.CurrentErigonClient.GetBlock(int64(number), "parity/geth")
+		block, _, err = rpc.CurrentErigonClient.GetBlock(int64(number), "geth")
 	}
 	if err != nil {
 		return nil, err
@@ -188,10 +192,19 @@ func GetExecutionBlockPageData(number uint64, limit int) (*types.Eth1BlockPageDa
 		if len(contractInteractionTypes) > i {
 			contractInteraction = contractInteractionTypes[i]
 		}
+		status := types.StatusType(tx.Status)
+		if status == types.StatusType_SUCCESS {
+			for _, itx := range tx.Itx {
+				if itx.ErrorMsg != "" {
+					status = types.StatusType_PARTIAL
+					break
+				}
+			}
+		}
 
 		txs = append(txs, types.Eth1BlockPageTransaction{
 			Hash:          fmt.Sprintf("%#x", tx.Hash),
-			HashFormatted: utils.FormatTransactionHash(tx.Hash, tx.ErrorMsg == ""),
+			HashFormatted: utils.FormatTransactionHashFromStatus(tx.Hash, status),
 			From:          fmt.Sprintf("%#x", tx.From),
 			FromFormatted: utils.FormatAddressWithLimits(tx.From, names[string(tx.From)], false, "address", 15, 20, true),
 			To:            fmt.Sprintf("%#x", tx.To),
@@ -221,12 +234,8 @@ func GetExecutionBlockPageData(number uint64, limit int) (*types.Eth1BlockPageDa
 		})
 	}
 
-	if limit > 0 {
-		if len(txs) > limit {
-			txs = txs[:limit]
-		} else {
-			txs = txs[:0]
-		}
+	if limit > 0 && len(txs) > limit {
+		txs = txs[:limit]
 	}
 
 	blobGasPrice := eip4844.CalcBlobFee(block.ExcessBlobGas)

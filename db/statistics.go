@@ -79,19 +79,20 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 		return fmt.Errorf("cannot export day %v as day %v has not yet been exported yet", day, int64(day)-1)
 	}
 
-	maxValidatorIndex, err := BigtableClient.GetMaxValidatorindexForEpoch(lastEpoch)
+	state, err := client.GetValidatorState(lastEpoch)
 	if err != nil {
-		return err
+		return fmt.Errorf("error retrieving validator state for epoch %v: %w", lastEpoch, err)
 	}
-	validators := make([]uint64, 0, maxValidatorIndex)
-	validatorData := make([]*types.ValidatorStatsTableDbRow, 0, maxValidatorIndex)
+
+	validators := make([]uint64, 0, len(state.Data))
+	validatorData := make([]*types.ValidatorStatsTableDbRow, 0, len(state.Data))
 	validatorDataMux := &sync.Mutex{}
 
-	logger.Infof("processing statistics for validators 0-%d", maxValidatorIndex)
-	for i := uint64(0); i <= maxValidatorIndex; i++ {
-		validators = append(validators, i)
+	logger.Infof("processing statistics for validators 0-%d", len(state.Data))
+	for i := 0; i < len(state.Data); i++ {
+		validators = append(validators, uint64(state.Data[i].Index))
 		validatorData = append(validatorData, &types.ValidatorStatsTableDbRow{
-			ValidatorIndex: i,
+			ValidatorIndex: uint64(state.Data[i].Index),
 			Day:            int64(day),
 		})
 	}
@@ -839,25 +840,10 @@ func gatherValidatorDepositWithdrawals(day uint64, data []*types.ValidatorStatsT
 
 	logger.Infof("gathering deposits + withdrawals")
 
-	type resRowDeposits struct {
-		ValidatorIndex uint64 `db:"validatorindex"`
-		Deposits       uint64 `db:"deposits"`
-		DepositsAmount uint64 `db:"deposits_amount"`
-	}
-	resDeposits := make([]*resRowDeposits, 0, 1024)
-	depositsQry := `
-			select validators.validatorindex, count(*) AS deposits, sum(amount) AS deposits_amount
-			from blocks_deposits
-			inner join validators on blocks_deposits.publickey = validators.pubkey
-			inner join blocks on blocks_deposits.block_root = blocks.blockroot
-			where blocks.slot >= $1 and blocks.slot <= $2 and (blocks.status = '1' OR blocks.slot = 0) and blocks_deposits.valid_signature
-			group by validators.validatorindex`
-
-	err := WriterDb.Select(&resDeposits, depositsQry, firstSlot, lastSlot)
+	resDeposits, err := GetValidatorDepositsAndIncomingConsolidations(&SlotRange{StartSlot: firstSlot, EndSlot: lastSlot}, nil)
 	if err != nil {
 		return fmt.Errorf("error retrieving deposits for day [%v], firstSlot [%v] and lastSlot [%v]: %w", day, firstSlot, lastSlot, err)
 	}
-
 	mux.Lock()
 	for _, r := range resDeposits {
 		data[r.ValidatorIndex].Deposits = int64(r.Deposits)
@@ -865,19 +851,7 @@ func gatherValidatorDepositWithdrawals(day uint64, data []*types.ValidatorStatsT
 	}
 	mux.Unlock()
 
-	type resRowWithdrawals struct {
-		ValidatorIndex    uint64 `db:"validatorindex"`
-		Withdrawals       uint64 `db:"withdrawals"`
-		WithdrawalsAmount uint64 `db:"withdrawals_amount"`
-	}
-	resWithdrawals := make([]*resRowWithdrawals, 0, 1024)
-
-	withdrawalsQuery := `select validatorindex, count(*) AS withdrawals, sum(amount) AS withdrawals_amount
-			from blocks_withdrawals
-			inner join blocks on blocks_withdrawals.block_root = blocks.blockroot
-			where block_slot >= $1 and block_slot <= $2 and blocks.status = '1'
-			group by validatorindex;`
-	err = WriterDb.Select(&resWithdrawals, withdrawalsQuery, firstSlot, lastSlot)
+	resWithdrawals, err := GetValidatorWithdrawalsAndOutgoingConsolidations(&SlotRange{StartSlot: firstSlot, EndSlot: lastSlot}, nil)
 	if err != nil {
 		return fmt.Errorf("error retrieving withdrawals for day [%v], firstSlot [%v] and lastSlot [%v]: %w", day, firstSlot, lastSlot, err)
 	}
@@ -1077,7 +1051,8 @@ func gatherValidatorMissedAttestationsStatisticsForDay(validators []uint64, day 
 			completedEpochData := epochParticipation[completedEpoch]
 
 			if completedEpochData == nil {
-				return fmt.Errorf("logic error, did not retrieve data for epoch %v", completedEpoch)
+				logger.Errorf("logic error, did not retrieve data for epoch %v (maybe epoch had not slots)", completedEpoch)
+				continue
 			}
 
 			mux.Lock()
@@ -1296,7 +1271,14 @@ func GetValidatorIncomeHistory(validatorIndices []uint64, lowerBoundDay uint64, 
 
 		var lastDeposits uint64
 		g.Go(func() error {
-			return GetValidatorDepositsForSlots(validatorIndices, firstSlot, lastSlot, &lastDeposits)
+			deposits, err := GetValidatorDepositsAndIncomingConsolidations(&SlotRange{StartSlot: firstSlot, EndSlot: lastSlot}, validatorIndices)
+			if err != nil {
+				return err
+			}
+			for _, deposit := range deposits {
+				lastDeposits += deposit.DepositsAmount
+			}
+			return nil
 		})
 
 		var lastWithdrawals uint64
@@ -1637,7 +1619,7 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 				totalBlobCount = totalBlobCount.Add(decimal.NewFromInt(int64(len(tx.BlobVersionedHashes))))
 
 			default:
-				logger.Fatalf("error unknown tx type %v hash: %x", tx.Status, tx.Hash)
+				logger.Fatalf("error unknown tx type %v hash: %x", tx.Type, tx.Hash)
 			}
 			totalTxFees = totalTxFees.Add(txFees)
 
@@ -1646,7 +1628,7 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 				failedTxCount += 1
 				totalFailedGasUsed = totalFailedGasUsed.Add(gasUsed)
 				totalFailedTxFee = totalFailedTxFee.Add(txFees)
-			case 1:
+			case 1, 2:
 				successTxCount += 1
 			default:
 				logger.Fatalf("error unknown status code %v hash: %x", tx.Status, tx.Hash)
@@ -1876,5 +1858,49 @@ func CheckIfDayIsFinalized(day uint64) error {
 		return fmt.Errorf("delaying statistics export as not all epochs for day %v are finalized. Last epoch of the day [%v] last finalized epoch [%v]", day, lastEpoch, latestFinalizedEpoch)
 	}
 
+	return nil
+}
+
+func AggregateDeposits() error {
+	start := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("statistics_aggregate_eth1_deposits").Observe(time.Since(start).Seconds())
+	}()
+	_, err := WriterDb.Exec(`
+		INSERT INTO eth1_deposits_aggregated (from_address, amount, validcount, invalidcount, slashedcount, totalcount, activecount, pendingcount, voluntary_exit_count)
+		SELECT
+			eth1.from_address,
+			SUM(eth1.amount) as amount,
+			SUM(eth1.validcount) AS validcount,
+			SUM(eth1.invalidcount) AS invalidcount,
+			COUNT(CASE WHEN v.status = 'slashed' THEN 1 END) AS slashedcount,
+			COUNT(v.pubkey) AS totalcount,
+			COUNT(CASE WHEN v.status = 'active_online' OR v.status = 'active_offline' THEN 1 END) as activecount,
+			COUNT(CASE WHEN v.status = 'deposited' THEN 1 END) AS pendingcount,
+			COUNT(CASE WHEN v.status = 'exited' THEN 1 END) AS voluntary_exit_count
+		FROM (
+			SELECT
+				from_address,
+				publickey,
+				SUM(amount) AS amount,
+				COUNT(CASE WHEN valid_signature = 't' THEN 1 END) AS validcount,
+				COUNT(CASE WHEN valid_signature = 'f' THEN 1 END) AS invalidcount
+			FROM eth1_deposits
+			GROUP BY from_address, publickey
+		) eth1
+		LEFT JOIN (SELECT pubkey, status FROM validators) v ON v.pubkey = eth1.publickey
+		GROUP BY eth1.from_address
+		ON CONFLICT (from_address) DO UPDATE SET
+			amount               = excluded.amount,
+			validcount           = excluded.validcount,
+			invalidcount         = excluded.invalidcount,
+			slashedcount         = excluded.slashedcount,
+			totalcount           = excluded.totalcount,
+			activecount          = excluded.activecount,
+			pendingcount         = excluded.pendingcount,
+			voluntary_exit_count = excluded.voluntary_exit_count`)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	return nil
 }

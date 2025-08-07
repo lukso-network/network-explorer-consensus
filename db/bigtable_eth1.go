@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +25,6 @@ import (
 	"github.com/gobitfly/eth2-beaconchain-explorer/types"
 	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
-	"strconv"
-
 	gcp_bigtable "cloud.google.com/go/bigtable"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -33,10 +32,9 @@ import (
 	"github.com/coocood/freecache"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	eth_types "github.com/ethereum/go-ethereum/core/types"
 	"github.com/go-redis/redis/v8"
-
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
@@ -661,7 +659,7 @@ func TimestampToBigtableTimeDesc(ts time.Time) string {
 	return fmt.Sprintf("%04d%02d%02d%02d%02d%02d", 9999-ts.Year(), 12-ts.Month(), 31-ts.Day(), 23-ts.Hour(), 59-ts.Minute(), 59-ts.Second())
 }
 
-func (bigtable *Bigtable) IndexEventsWithTransformers(start, end int64, transforms []func(blk *types.Eth1Block, cache *freecache.Cache) (bulkData *types.BulkMutations, bulkMetadataUpdates *types.BulkMutations, err error), concurrency int64, cache *freecache.Cache) error {
+func (bigtable *Bigtable) IndexEventsWithTransformers(start, end int64, transforms []TransformFunc, concurrency int64, cache *freecache.Cache) error {
 	g := new(errgroup.Group)
 	g.SetLimit(int(concurrency))
 
@@ -703,9 +701,10 @@ func (bigtable *Bigtable) IndexEventsWithTransformers(start, end int64, transfor
 						if err != nil {
 							logrus.WithError(err).Errorf("error transforming block [%v]", block.Number)
 						}
-						bulkMutsData.Keys = append(bulkMutsData.Keys, mutsData.Keys...)
-						bulkMutsData.Muts = append(bulkMutsData.Muts, mutsData.Muts...)
-
+						if mutsData != nil {
+							bulkMutsData.Keys = append(bulkMutsData.Keys, mutsData.Keys...)
+							bulkMutsData.Muts = append(bulkMutsData.Muts, mutsData.Muts...)
+						}
 						if mutsMetadataUpdate != nil {
 							bulkMutsMetadataUpdate.Keys = append(bulkMutsMetadataUpdate.Keys, mutsMetadataUpdate.Keys...)
 							bulkMutsMetadataUpdate.Muts = append(bulkMutsMetadataUpdate.Muts, mutsMetadataUpdate.Muts...)
@@ -765,6 +764,61 @@ func (bigtable *Bigtable) IndexEventsWithTransformers(start, end int64, transfor
 			return err
 		}
 	}
+	return nil
+}
+
+type TransformFunc func(blk *types.Eth1Block, cache *freecache.Cache) (bulkData *types.BulkMutations, bulkMetadataUpdates *types.BulkMutations, err error)
+
+func (bigtable *Bigtable) blockKeysMutation(blockNumber uint64, blockHash []byte, keys string) (string, *gcp_bigtable.Mutation) {
+	mut := gcp_bigtable.NewMutation()
+	mut.Set(METADATA_UPDATES_FAMILY_BLOCKS, "keys", gcp_bigtable.Now(), []byte(keys))
+
+	key := fmt.Sprintf("%s:BLOCK:%s:%x", bigtable.chainId, reversedPaddedBlockNumber(blockNumber), blockHash)
+	return key, mut
+}
+
+func (bigtable *Bigtable) IndexBlocksWithTransformers(blocks []*types.Eth1Block, transforms []TransformFunc, cache *freecache.Cache) error {
+	bulkMutsData := types.BulkMutations{}
+	bulkMutsMetadataUpdate := types.BulkMutations{}
+	for _, block := range blocks {
+		for _, transform := range transforms {
+			mutsData, mutsMetadataUpdate, err := transform(block, cache)
+			if err != nil {
+				logrus.WithError(err).Errorf("error transforming block [%v]", block.Number)
+			}
+			if mutsData != nil {
+				bulkMutsData.Keys = append(bulkMutsData.Keys, mutsData.Keys...)
+				bulkMutsData.Muts = append(bulkMutsData.Muts, mutsData.Muts...)
+			}
+
+			if mutsMetadataUpdate != nil {
+				bulkMutsMetadataUpdate.Keys = append(bulkMutsMetadataUpdate.Keys, mutsMetadataUpdate.Keys...)
+				bulkMutsMetadataUpdate.Muts = append(bulkMutsMetadataUpdate.Muts, mutsMetadataUpdate.Muts...)
+			}
+
+			if mutsData != nil && len(mutsData.Keys) > 0 {
+				metaKeys := strings.Join(bulkMutsData.Keys, ",") // save block keys in order to be able to handle chain reorgs
+				key, mut := bigtable.blockKeysMutation(block.Number, block.Hash, metaKeys)
+				bulkMutsMetadataUpdate.Keys = append(bulkMutsMetadataUpdate.Keys, key)
+				bulkMutsMetadataUpdate.Muts = append(bulkMutsMetadataUpdate.Muts, mut)
+			}
+		}
+	}
+
+	if len(bulkMutsData.Keys) > 0 {
+		err := bigtable.WriteBulk(&bulkMutsData, bigtable.tableData, DEFAULT_BATCH_INSERTS)
+		if err != nil {
+			return fmt.Errorf("error writing blocks [%v-%v] to bigtable data table: %w", blocks[0].Number, blocks[len(blocks)-1].Number, err)
+		}
+	}
+
+	if len(bulkMutsMetadataUpdate.Keys) > 0 {
+		err := bigtable.WriteBulk(&bulkMutsMetadataUpdate, bigtable.tableMetadataUpdates, DEFAULT_BATCH_INSERTS)
+		if err != nil {
+			return fmt.Errorf("error writing blocks [%v-%v] to bigtable metadata updates table: %w", blocks[0].Number, blocks[len(blocks)-1].Number, err)
+		}
+	}
+
 	return nil
 }
 
@@ -855,7 +909,7 @@ func (bigtable *Bigtable) TransformBlock(block *types.Eth1Block, cache *freecach
 		txFee := new(big.Int).Mul(new(big.Int).SetBytes(t.GasPrice), big.NewInt(int64(t.GasUsed)))
 
 		if len(block.BaseFee) > 0 {
-			effectiveGasPrice := math.BigMin(new(big.Int).Add(new(big.Int).SetBytes(t.MaxPriorityFeePerGas), new(big.Int).SetBytes(block.BaseFee)), new(big.Int).SetBytes(t.MaxFeePerGas))
+			effectiveGasPrice := bigMin(new(big.Int).Add(new(big.Int).SetBytes(t.MaxPriorityFeePerGas), new(big.Int).SetBytes(block.BaseFee)), new(big.Int).SetBytes(t.MaxFeePerGas))
 			proposerGasPricePart := new(big.Int).Sub(effectiveGasPrice, new(big.Int).SetBytes(block.BaseFee))
 
 			if proposerGasPricePart.Cmp(big.NewInt(0)) >= 0 {
@@ -951,13 +1005,20 @@ func CalculateTxFeesFromBlock(block *types.Eth1Block) *big.Int {
 	return txFees
 }
 
+func bigMin(x, y *big.Int) *big.Int {
+	if x.Cmp(y) > 0 {
+		return y
+	}
+	return x
+}
+
 func CalculateTxFeeFromTransaction(tx *types.Eth1Transaction, blockBaseFee *big.Int) *big.Int {
 	// calculate tx fee depending on tx type
 	txFee := new(big.Int).SetUint64(tx.GasUsed)
 	switch tx.Type {
 	case 0, 1:
 		txFee.Mul(txFee, new(big.Int).SetBytes(tx.GasPrice))
-	case 2, 3:
+	case 2, 3, 4:
 		// multiply gasused with min(baseFee + maxpriorityfee, maxfee)
 		if normalGasPrice, maxGasPrice := new(big.Int).Add(blockBaseFee, new(big.Int).SetBytes(tx.MaxPriorityFeePerGas)), new(big.Int).SetBytes(tx.MaxFeePerGas); normalGasPrice.Cmp(maxGasPrice) <= 0 {
 			txFee.Mul(txFee, normalGasPrice)
@@ -965,7 +1026,7 @@ func CalculateTxFeeFromTransaction(tx *types.Eth1Transaction, blockBaseFee *big.
 			txFee.Mul(txFee, maxGasPrice)
 		}
 	default:
-		logger.Errorf("unknown tx type %v", tx.Type)
+		utils.LogError(fmt.Errorf("unknown tx type %v", tx.Type), "error calculating tx fee", 0)
 	}
 	return txFee
 }
@@ -1011,11 +1072,22 @@ func (bigtable *Bigtable) TransformTx(blk *types.Eth1Block, cache *freecache.Cac
 			Value:              tx.GetValue(),
 			TxFee:              fee,
 			GasPrice:           tx.GetGasPrice(),
+			IsContractCreation: isContract,
+			ErrorMsg:           "",
 			BlobTxFee:          blobFee,
 			BlobGasPrice:       tx.GetBlobGasPrice(),
-			IsContractCreation: isContract,
-			ErrorMsg:           tx.GetErrorMsg(),
+			Status:             types.StatusType(tx.Status),
 		}
+		for _, itx := range tx.Itx {
+			if itx.ErrorMsg != "" {
+				indexedTx.ErrorMsg = itx.ErrorMsg
+				if indexedTx.Status == types.StatusType_SUCCESS {
+					indexedTx.Status = types.StatusType_PARTIAL
+				}
+				break
+			}
+		}
+
 		// Mark Sender and Recipient for balance update
 		bigtable.markBalanceUpdate(indexedTx.From, []byte{0x0}, bulkMetadataUpdates, cache)
 		bigtable.markBalanceUpdate(indexedTx.To, []byte{0x0}, bulkMetadataUpdates, cache)
@@ -1107,9 +1179,16 @@ func (bigtable *Bigtable) TransformBlobTx(blk *types.Eth1Block, cache *freecache
 			GasPrice:            tx.GetGasPrice(),
 			BlobTxFee:           blobFee,
 			BlobGasPrice:        tx.GetBlobGasPrice(),
-			ErrorMsg:            tx.GetErrorMsg(),
+			ErrorMsg:            "",
 			BlobVersionedHashes: tx.GetBlobVersionedHashes(),
 		}
+		for _, itx := range tx.Itx {
+			if itx.ErrorMsg != "" {
+				indexedTx.ErrorMsg = itx.ErrorMsg
+				break
+			}
+		}
+
 		// Mark Sender and Recipient for balance update
 		bigtable.markBalanceUpdate(indexedTx.From, []byte{0x0}, bulkMetadataUpdates, cache)
 		bigtable.markBalanceUpdate(indexedTx.To, []byte{0x0}, bulkMetadataUpdates, cache)
@@ -1218,7 +1297,7 @@ func (bigtable *Bigtable) TransformContract(blk *types.Eth1Block, cache *freecac
 				contractUpdate := &types.IsContractUpdate{
 					IsContract: itx.GetType() == "create",
 					// also use success status of enclosing transaction, as even successful sub-calls can still be reverted later in the tx
-					Success: itx.GetErrorMsg() == "" && tx.GetErrorMsg() == "",
+					Success: itx.GetErrorMsg() == "" && tx.GetStatus() == 1,
 				}
 				b, err := proto.Marshal(contractUpdate)
 				if err != nil {
@@ -1286,11 +1365,25 @@ func (bigtable *Bigtable) TransformItx(blk *types.Eth1Block, cache *freecache.Ca
 		}
 		iReversed := reversePaddedIndex(i, TX_PER_BLOCK_LIMIT)
 
+		var revertSource string
 		for j, itx := range tx.GetItx() {
-			if j >= ITX_PER_TX_LIMIT {
+			if j > ITX_PER_TX_LIMIT {
 				return nil, nil, fmt.Errorf("unexpected number of internal transactions in block expected at most %d but got: %v, tx: %x", ITX_PER_TX_LIMIT, j, tx.GetHash())
 			}
 			jReversed := reversePaddedIndex(j, ITX_PER_TX_LIMIT)
+
+			// check for error before skipping, otherwise we loose track of cascading reverts
+			var reverted bool
+			if itx.ErrorMsg != "" {
+				reverted = true
+				// only save the highest root revert
+				if revertSource == "" || !strings.HasPrefix(itx.Path, revertSource) {
+					revertSource = strings.TrimSuffix(itx.Path, "]")
+				}
+			}
+			if revertSource != "" && strings.HasPrefix(itx.Path, revertSource) {
+				reverted = true
+			}
 
 			if itx.Path == "[]" || bytes.Equal(itx.Value, []byte{0x0}) { // skip top level and empty calls
 				continue
@@ -1305,6 +1398,7 @@ func (bigtable *Bigtable) TransformItx(blk *types.Eth1Block, cache *freecache.Ca
 				From:        itx.GetFrom(),
 				To:          itx.GetTo(),
 				Value:       itx.GetValue(),
+				Reverted:    reverted,
 			}
 
 			bigtable.markBalanceUpdate(indexedItx.To, []byte{0x0}, bulkMetadataUpdates, cache)
@@ -2013,6 +2107,210 @@ func (bigtable *Bigtable) TransformWithdrawals(block *types.Eth1Block, cache *fr
 	return bulkData, bulkMetadataUpdates, nil
 }
 
+type BridgeQueueRequest struct {
+	TxHash         []byte
+	TxIndex        int
+	ItxIndex       int
+	BlockNumber    uint64
+	BlockTimestamp time.Time
+	From           []byte
+	Fee            uint64
+}
+
+func (bigtable *Bigtable) TransformConsolidationRequests(blk *types.Eth1Block, cache *freecache.Cache) (bulkData *types.BulkMutations, bulkMetadataUpdates *types.BulkMutations, err error) {
+	consolidationContractAddress := hexutil.MustDecode(utils.Config.Chain.PectraConsolidationRequestContractAddress)
+	startTime := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("bt_transform_consolidation_requests").Observe(time.Since(startTime).Seconds())
+	}()
+
+	var queueRequests []BridgeQueueRequest
+	for i, tx := range blk.GetTransactions() {
+		if i >= TX_PER_BLOCK_LIMIT {
+			return nil, nil, fmt.Errorf("unexpected number of transactions in block expected at most %d but got: %v, tx: %x", TX_PER_BLOCK_LIMIT-1, i, tx.GetHash())
+		}
+
+		var revertSource string
+		for j, itx := range tx.GetItx() {
+			if j > ITX_PER_TX_LIMIT {
+				return nil, nil, fmt.Errorf("unexpected number of internal transactions in block expected at most %d but got: %v, tx: %x", ITX_PER_TX_LIMIT, j, tx.GetHash())
+			}
+			// check for error before skipping, otherwise we loose track of cascading reverts
+			if itx.ErrorMsg != "" {
+				if revertSource == "" || !strings.HasPrefix(itx.Path, revertSource) {
+					revertSource = strings.TrimSuffix(itx.Path, "]")
+				}
+				continue
+			}
+			if revertSource != "" && strings.HasPrefix(itx.Path, revertSource) {
+				continue
+			}
+
+			if !bytes.Equal(itx.To, consolidationContractAddress) {
+				continue
+			}
+
+			if itx.Type == "staticcall" {
+				continue
+			}
+
+			if bytes.Equal(itx.Value, []byte{0x0}) {
+				continue
+			}
+
+			queueRequests = append(queueRequests, BridgeQueueRequest{
+				Fee:            new(big.Int).SetBytes(itx.Value).Uint64(),
+				TxHash:         tx.Hash,
+				TxIndex:        i,
+				ItxIndex:       j,
+				BlockNumber:    blk.Number,
+				BlockTimestamp: blk.Time.AsTime(),
+				From:           tx.From,
+			})
+		}
+	}
+
+	var requestIndex int
+	for _, tx := range blk.GetTransactions() {
+		for _, log := range tx.GetLogs() {
+			if bytes.Equal(log.Address, consolidationContractAddress) {
+				// we have found a consolidation event
+				// now slice out the data
+				// source_address: Bytes20
+				// source_pubkey: Bytes48
+				// target_pubkey: Bytes48
+
+				elData := types.ElConsolidationRequestData(log.Data)
+				sourceAddress, _ := elData.GetSourceAddressBytes()
+				sourcePubkey, _ := elData.GetSourceValidatorPubkey()
+				targetPubkey, _ := elData.GetTargetValidatorPubkey()
+
+				if sourceAddress == nil || sourcePubkey == nil || targetPubkey == nil {
+					logger.Warnf("error parsing consolidation event: %x %x %d", sourceAddress, sourcePubkey, targetPubkey)
+					continue
+				}
+
+				logger.Infof("consolidation event: %x %x %x", sourceAddress, sourcePubkey, targetPubkey)
+
+				request := queueRequests[requestIndex]
+				_, err := WriterDb.Exec(`
+				INSERT INTO eth1_consolidation_requests (tx_hash, tx_index, itx_index, block_number, block_ts, from_address, fee, source_address, source_pubkey, target_pubkey) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (tx_hash, tx_index, itx_index) DO UPDATE
+				SET block_number = EXCLUDED.block_number, block_ts = EXCLUDED.block_ts, from_address = EXCLUDED.from_address, fee = EXCLUDED.fee, source_address = EXCLUDED.source_address, source_pubkey = EXCLUDED.source_pubkey, target_pubkey = EXCLUDED.target_pubkey
+				`, request.TxHash, request.TxIndex, request.ItxIndex, request.BlockNumber, request.BlockTimestamp, request.From, request.Fee, sourceAddress, sourcePubkey, targetPubkey)
+
+				if err != nil {
+					return nil, nil, err
+				}
+				requestIndex++
+			}
+		}
+	}
+
+	if requestIndex != len(queueRequests) {
+		logger.Errorf("unexpected number of consolidation requests for block %d", blk.Number)
+	}
+
+	return bulkData, bulkMetadataUpdates, nil
+}
+
+func (bigtable *Bigtable) TransformWithdrawalRequests(blk *types.Eth1Block, cache *freecache.Cache) (bulkData *types.BulkMutations, bulkMetadataUpdates *types.BulkMutations, err error) {
+	withdrawalContractAddress := hexutil.MustDecode(utils.Config.Chain.PectraWithdrawalRequestContractAddress)
+	startTime := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("bt_transform_withdrawal_requests").Observe(time.Since(startTime).Seconds())
+	}()
+
+	var queueRequests []BridgeQueueRequest
+	for i, tx := range blk.GetTransactions() {
+		if i >= TX_PER_BLOCK_LIMIT {
+			return nil, nil, fmt.Errorf("unexpected number of transactions in block expected at most %d but got: %v, tx: %x", TX_PER_BLOCK_LIMIT-1, i, tx.GetHash())
+		}
+
+		var revertSource string
+		for j, itx := range tx.GetItx() {
+			if j > ITX_PER_TX_LIMIT {
+				return nil, nil, fmt.Errorf("unexpected number of internal transactions in block expected at most %d but got: %v, tx: %x", ITX_PER_TX_LIMIT, j, tx.GetHash())
+			}
+			// check for error before skipping, otherwise we loose track of cascading reverts
+			if itx.ErrorMsg != "" {
+				if revertSource == "" || !strings.HasPrefix(itx.Path, revertSource) {
+					revertSource = strings.TrimSuffix(itx.Path, "]")
+				}
+				continue
+			}
+			if revertSource != "" && strings.HasPrefix(itx.Path, revertSource) {
+				continue
+			}
+
+			if !bytes.Equal(itx.To, withdrawalContractAddress) {
+				continue
+			}
+
+			if itx.Type == "staticcall" {
+				continue
+			}
+
+			if bytes.Equal(itx.Value, []byte{0x0}) {
+				continue
+			}
+
+			queueRequests = append(queueRequests, BridgeQueueRequest{
+				Fee:            new(big.Int).SetBytes(itx.Value).Uint64(),
+				TxHash:         tx.Hash,
+				TxIndex:        i,
+				ItxIndex:       j,
+				BlockNumber:    blk.Number,
+				BlockTimestamp: blk.Time.AsTime(),
+				From:           tx.From,
+			})
+		}
+	}
+
+	var requestIndex int
+	for _, tx := range blk.GetTransactions() {
+		for _, log := range tx.GetLogs() {
+			if bytes.Equal(log.Address, withdrawalContractAddress) {
+				// we have found a withdrawal event
+				// now slice out the data
+				// source_address: Bytes20
+				// validator_pubkey: Bytes48
+				// amount: uint64
+
+				elData := types.ElWithdrawalRequestData(log.Data)
+				sourceAddress, _ := elData.GetSourceAddressBytes()
+				validatorPubkey, _ := elData.GetValidatorPubkey()
+				amount, _ := elData.GetAmountUint64()
+
+				if sourceAddress == nil || validatorPubkey == nil {
+					logger.Warnf("error parsing withdrawal event: %x %x %d", sourceAddress, validatorPubkey, amount)
+					continue
+				}
+
+				logger.Infof("withdrawal event: %x %x %d", sourceAddress, validatorPubkey, amount)
+
+				request := queueRequests[requestIndex]
+				_, err := WriterDb.Exec(`
+				INSERT INTO eth1_withdrawal_requests (tx_hash, tx_index, itx_index, block_number, block_ts, from_address, fee, source_address, validator_pubkey, amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				ON CONFLICT (tx_hash, tx_index, itx_index) DO UPDATE
+				SET block_number = EXCLUDED.block_number, block_ts = EXCLUDED.block_ts, from_address = EXCLUDED.from_address, fee = EXCLUDED.fee, source_address = EXCLUDED.source_address, validator_pubkey = EXCLUDED.validator_pubkey, amount = EXCLUDED.amount
+				`, request.TxHash, request.TxIndex, request.ItxIndex, request.BlockNumber, request.BlockTimestamp, request.From, request.Fee, sourceAddress, validatorPubkey, amount)
+
+				if err != nil {
+					return nil, nil, err
+				}
+				requestIndex++
+			}
+		}
+	}
+
+	if requestIndex != len(queueRequests) {
+		logger.Errorf("unexpected number of withdrawal requests for block %d", blk.Number)
+	}
+
+	return bulkData, bulkMetadataUpdates, nil
+}
+
 type IndexKeys struct {
 	indexes []string
 	keys    []string
@@ -2346,7 +2644,7 @@ func (bigtable *Bigtable) GetAddressTransactionsTableData(address []byte, pageTo
 		}
 
 		tableData[i] = []interface{}{
-			utils.FormatTransactionHash(t.Hash, t.ErrorMsg == ""),
+			utils.FormatTransactionHashFromStatus(t.Hash, t.Status),
 			utils.FormatMethod(bigtable.GetMethodLabel(t.MethodId, contractInteraction)),
 			utils.FormatBlockNumber(t.BlockNumber),
 			utils.FormatTimestamp(t.Time.AsTime().Unix()),
@@ -2825,7 +3123,7 @@ func (bigtable *Bigtable) GetAddressInternalTableData(address []byte, pageToken 
 		}
 
 		tableData[i] = []interface{}{
-			utils.FormatTransactionHash(t.ParentHash, true),
+			utils.FormatTransactionHash(t.ParentHash, !t.Reverted),
 			utils.FormatBlockNumber(t.BlockNumber),
 			utils.FormatTimestamp(t.Time.AsTime().Unix()),
 			utils.FormatAddressWithLimitsInAddressPageTable(address, t.From, BigtableClient.GetAddressLabel(fromName, from_contractInteraction), from_contractInteraction != types.CONTRACT_NONE, digitLimitInAddressPagesTable, nameLimitInAddressPagesTable, true),
@@ -2849,13 +3147,15 @@ func (bigtable *Bigtable) GetAddressInternalTableData(address []byte, pageToken 
 	return data, nil
 }
 
-func (bigtable *Bigtable) GetInternalTransfersForTransaction(transaction []byte, from []byte, parityTrace []*rpc.ParityTraceResult, currency string) ([]types.ITransaction, error) {
+func (bigtable *Bigtable) GetInternalTransfersForTransaction(transaction []byte, from []byte, traces []*rpc.GethTraceCallResult, currency string, blockNumber *big.Int) ([]types.ITransaction, error) {
+	if len(traces) == 0 {
+		return nil, nil
+	}
 
 	names := make(map[string]string)
-	for _, trace := range parityTrace {
-		from, to, _, _ := trace.ConvertFields()
-		names[string(from)] = ""
-		names[string(to)] = ""
+	for _, trace := range traces {
+		names[trace.From.String()] = ""
+		names[trace.To.String()] = ""
 	}
 
 	err := bigtable.GetAddressNames(names)
@@ -2863,21 +3163,32 @@ func (bigtable *Bigtable) GetInternalTransfersForTransaction(transaction []byte,
 		return nil, err
 	}
 
-	contractInteractionTypes, err := BigtableClient.GetAddressContractInteractionsAtParityTraces(parityTrace)
+	contractInteractionTypes, err := BigtableClient.GetAddressContractInteractionsAtTraces(traces, blockNumber)
 	if err != nil {
 		utils.LogError(err, "error getting contract states", 0)
 	}
 
-	data := make([]types.ITransaction, 0, len(parityTrace)-1)
-	for i := 1; i < len(parityTrace); i++ {
-		from, to, value, tx_type := parityTrace[i].ConvertFields()
+	paths := make(map[*rpc.GethTraceCallResult]string)
+	data := make([]types.ITransaction, 0, len(traces)-1)
+	revertedTraces := make(map[*rpc.GethTraceCallResult]struct{})
+	for i := 1; i < len(traces); i++ {
+		for index, call := range traces[i].Calls {
+			paths[call] = fmt.Sprintf("%s %d", paths[traces[i]], index)
+		}
+
+		reverted := isReverted(traces[i], revertedTraces)
+
+		from := traces[i].From.Bytes()
+		to := traces[i].To.Bytes()
+		value := common.FromHex(traces[i].Value)
+		tx_type := traces[i].Type
 		if tx_type == "suicide" {
 			// erigon's "suicide" might be misleading for users
 			tx_type = "selfdestruct"
 		}
 		input := make([]byte, 0)
-		if len(parityTrace[i].Action.Input) > 2 {
-			input, err = hex.DecodeString(parityTrace[i].Action.Input[2:])
+		if len(traces[i].Input) > 2 {
+			input, err = hex.DecodeString(traces[i].Input[2:])
 			if err != nil {
 				utils.LogError(err, "can't convert hex string", 0)
 			}
@@ -2896,22 +3207,39 @@ func (bigtable *Bigtable) GetInternalTransfersForTransaction(transaction []byte,
 			From:      utils.FormatAddress(from, nil, fromName, false, from_contractInteraction != types.CONTRACT_NONE, true),
 			To:        utils.FormatAddress(to, nil, toName, false, to_contractInteraction != types.CONTRACT_NONE, true),
 			Amount:    utils.FormatElCurrency(value, currency, 8, true, false, false, true),
-			TracePath: utils.FormatTracePath(tx_type, parityTrace[i].TraceAddress, parityTrace[i].Error == "", bigtable.GetMethodLabel(input, from_contractInteraction)),
+			TracePath: utils.FormatGethTracePath(tx_type, paths[traces[i]], !reverted, bigtable.GetMethodLabel(input, from_contractInteraction)),
 			Advanced:  tx_type == "delegatecall" || string(value) == "\x00",
+			Reverted:  reverted,
 		}
 
-		gaslimit, err := strconv.ParseUint(parityTrace[i].Action.Gas, 0, 0)
+		gaslimit, err := strconv.ParseUint(traces[i].Gas, 0, 0)
 		if err == nil {
 			itx.Gas.Limit = gaslimit
 		}
 
 		data = append(data, itx)
-		// gasusage, err := strconv.ParseUint(parityTrace[i].Result.GasUsed, 0, 0)
+		// gasusage, err := strconv.ParseUint(traces[i].Result.GasUsed, 0, 0)
 		// if err == nil {
 		// 	itx.Gas.Usage = gasusage
 		// }
 	}
 	return data, nil
+}
+
+func isReverted(internal *rpc.GethTraceCallResult, revertedTraces map[*rpc.GethTraceCallResult]struct{}) bool {
+	if _, exist := revertedTraces[internal]; exist {
+		return true
+	}
+	var reverted bool
+	if internal.Error != "" {
+		reverted = true
+		calls := internal.Calls
+		for len(calls) != 0 {
+			revertedTraces[calls[0]] = struct{}{}
+			calls = append(calls[1:], calls[0].Calls...)
+		}
+	}
+	return reverted
 }
 
 // currently only erc20
@@ -2953,7 +3281,7 @@ func (bigtable *Bigtable) GetArbitraryTokenTransfersForTransaction(transaction [
 		return true
 	}, gcp_bigtable.LimitRows(256))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error reading rows: %w", err)
 	}
 
 	names := make(map[string]string)
@@ -2970,7 +3298,7 @@ func (bigtable *Bigtable) GetArbitraryTokenTransfersForTransaction(transaction [
 	g.Go(func() error {
 		err := bigtable.GetAddressNames(names)
 		if err != nil {
-			return err
+			return fmt.Errorf("error getting address names: %w", err)
 		}
 		return nil
 	})
@@ -2980,7 +3308,7 @@ func (bigtable *Bigtable) GetArbitraryTokenTransfersForTransaction(transaction [
 		g.Go(func() error {
 			metadata, err := bigtable.GetERC20MetadataForAddress([]byte(address))
 			if err != nil {
-				return err
+				return fmt.Errorf("error getting erc20 metadata for address %v: %w", address, err)
 			}
 			mux.Lock()
 			tokensToAdd[address] = metadata
@@ -2990,7 +3318,7 @@ func (bigtable *Bigtable) GetArbitraryTokenTransfersForTransaction(transaction [
 	}
 	err = g.Wait()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error getting token metadata: %w", err)
 	}
 
 	for k, v := range tokensToAdd {
@@ -3612,7 +3940,7 @@ func (bigtable *Bigtable) GetBalanceForAddress(address []byte, token []byte) (*t
 		return nil, nil
 	}
 	if val, ok := row[ACCOUNT_METADATA_FAMILY]; ok {
-		if val == nil || len(val) < 1 {
+		if len(val) < 1 {
 			return nil, fmt.Errorf("ReadItem is empty or nil")
 		}
 
@@ -4033,20 +4361,19 @@ func (bigtable *Bigtable) GetAddressContractInteractionsAtITransactions(itransac
 	return resultPairs, nil
 }
 
-// convenience function to get contract interaction status per parity trace
-func (bigtable *Bigtable) GetAddressContractInteractionsAtParityTraces(traces []*rpc.ParityTraceResult) ([][2]types.ContractInteractionType, error) {
+// convenience function to get contract interaction status per trace
+func (bigtable *Bigtable) GetAddressContractInteractionsAtTraces(traces []*rpc.GethTraceCallResult, blockNumber *big.Int) ([][2]types.ContractInteractionType, error) {
 	requests := make([]contractInteractionAtRequest, 0, len(traces)*2)
 	for i, itx := range traces {
-		from, to, _, _ := itx.ConvertFields()
 		requests = append(requests, contractInteractionAtRequest{
-			address:  fmt.Sprintf("%x", from),
-			block:    int64(itx.BlockNumber),
+			address:  itx.From.String(),
+			block:    blockNumber.Int64(),
 			txIdx:    int64(itx.TransactionPosition),
 			traceIdx: int64(i),
 		})
 		requests = append(requests, contractInteractionAtRequest{
-			address:  fmt.Sprintf("%x", to),
-			block:    int64(itx.BlockNumber),
+			address:  itx.To.String(),
+			block:    blockNumber.Int64(),
 			txIdx:    int64(itx.TransactionPosition),
 			traceIdx: int64(i),
 		})
@@ -4863,4 +5190,96 @@ func (bigtable *Bigtable) GetGasNowHistory(ts, pastTs time.Time) ([]types.GasNow
 		return nil, fmt.Errorf("error getting gas now history to bigtable, err: %w", err)
 	}
 	return history, nil
+}
+
+func (bigtable *Bigtable) ReindexITxsFromNode(start, end, batchSize, concurrency int64, transforms []func(blk *types.Eth1Block, cache *freecache.Cache) (bulkData *types.BulkMutations, bulkMetadataUpdates *types.BulkMutations, err error), cache *freecache.Cache) error {
+	g := new(errgroup.Group)
+	g.SetLimit(int(concurrency))
+
+	if start == 0 && end == 0 {
+		return fmt.Errorf("start or end block height can't be 0")
+	}
+
+	if end < start {
+		return fmt.Errorf("end block must be grater or equal to start block")
+	}
+
+	logrus.Infof("reindexing txs for blocks from %d to %d", start, end)
+
+	for i := start; i <= end; i += batchSize {
+		firstBlock := i
+		lastBlock := firstBlock + batchSize - 1
+		if lastBlock > end {
+			lastBlock = end
+		}
+
+		blockNumbers := make([]int64, 0, lastBlock-firstBlock+1)
+		for b := firstBlock; b <= lastBlock; b++ {
+			blockNumbers = append(blockNumbers, b)
+		}
+
+		g.Go(func() error {
+			blocks, err := rpc.CurrentErigonClient.GetBlocksByBatch(blockNumbers)
+			if err != nil {
+				return fmt.Errorf("error getting blocks by batch from %v to %v: %v", firstBlock, lastBlock, err)
+			}
+
+			subG := new(errgroup.Group)
+			subG.SetLimit(int(concurrency))
+
+			for _, block := range blocks {
+				currentBlock := block
+				subG.Go(func() error {
+					bulkMutsData := types.BulkMutations{}
+					bulkMutsMetadataUpdate := types.BulkMutations{}
+					for _, transform := range transforms {
+						mutsData, mutsMetadataUpdate, err := transform(currentBlock, cache)
+						if err != nil {
+							logrus.WithError(err).Errorf("error transforming block [%v]", currentBlock.Number)
+						}
+						bulkMutsData.Keys = append(bulkMutsData.Keys, mutsData.Keys...)
+						bulkMutsData.Muts = append(bulkMutsData.Muts, mutsData.Muts...)
+
+						if mutsMetadataUpdate != nil {
+							bulkMutsMetadataUpdate.Keys = append(bulkMutsMetadataUpdate.Keys, mutsMetadataUpdate.Keys...)
+							bulkMutsMetadataUpdate.Muts = append(bulkMutsMetadataUpdate.Muts, mutsMetadataUpdate.Muts...)
+						}
+					}
+
+					if len(bulkMutsData.Keys) > 0 {
+						metaKeys := strings.Join(bulkMutsData.Keys, ",") // save block keys in order to be able to handle chain reorgs
+						err := bigtable.SaveBlockKeys(currentBlock.Number, currentBlock.Hash, metaKeys)
+						if err != nil {
+							return fmt.Errorf("error saving block [%v] keys to bigtable metadata updates table: %w", currentBlock.Number, err)
+						}
+
+						err = bigtable.WriteBulk(&bulkMutsData, bigtable.tableData, DEFAULT_BATCH_INSERTS)
+						if err != nil {
+							return fmt.Errorf("error writing block [%v] to bigtable data table: %w", currentBlock.Number, err)
+						}
+					}
+
+					if len(bulkMutsMetadataUpdate.Keys) > 0 {
+						err := bigtable.WriteBulk(&bulkMutsMetadataUpdate, bigtable.tableMetadataUpdates, DEFAULT_BATCH_INSERTS)
+						if err != nil {
+							return fmt.Errorf("error writing block [%v] to bigtable metadata updates table: %w", currentBlock.Number, err)
+						}
+					}
+
+					return nil
+				})
+			}
+			return subG.Wait()
+		})
+
+	}
+
+	if err := g.Wait(); err == nil {
+		logrus.Info("data table indexing completed")
+	} else {
+		utils.LogError(err, "wait group error", 0)
+		return err
+	}
+
+	return nil
 }

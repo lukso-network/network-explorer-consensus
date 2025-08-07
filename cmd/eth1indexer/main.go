@@ -48,7 +48,7 @@ func main() {
 	offsetBlocks := flag.Int64("blocks.offset", 100, "Blocks offset")
 	checkBlocksGaps := flag.Bool("blocks.gaps", false, "Check for gaps in the blocks table")
 	checkBlocksGapsLookback := flag.Int("blocks.gaps.lookback", 1000000, "Lookback for gaps check of the blocks table")
-	traceMode := flag.String("blocks.tracemode", "parity/geth", "Trace mode to use, can bei either 'parity', 'geth' or 'parity/geth' for both")
+	traceMode := flag.String("blocks.tracemode", "geth", "Trace mode to use, can bei either 'parity', 'geth' or 'parity/geth' for both")
 
 	concurrencyData := flag.Int64("data.concurrency", 30, "Concurrency to use when indexing data from bigtable")
 	startData := flag.Int64("data.start", 0, "Block to start indexing")
@@ -104,6 +104,14 @@ func main() {
 			logrus.Infof("starting pprof http server on port %s", utils.Config.Pprof.Port)
 			logrus.Info(http.ListenAndServe(fmt.Sprintf("localhost:%s", utils.Config.Pprof.Port), nil))
 		}()
+	}
+
+	if utils.Config.Chain.PectraWithdrawalRequestContractAddress == "" {
+		utils.LogFatal(nil, "missing config pectraWithdrawalRequestContractAddress, please provide via explorer config", 0)
+	}
+
+	if utils.Config.Chain.PectraConsolidationRequestContractAddress == "" {
+		utils.LogFatal(nil, "missing config pectraConsolidationRequestContractAddress, please provide via explorer config", 0)
 	}
 
 	db.MustInitDB(&types.DatabaseConfig{
@@ -187,7 +195,7 @@ func main() {
 		return
 	}
 
-	transforms := make([]func(blk *types.Eth1Block, cache *freecache.Cache) (*types.BulkMutations, *types.BulkMutations, error), 0)
+	transforms := make([]db.TransformFunc, 0)
 	transforms = append(transforms,
 		bt.TransformBlock,
 		bt.TransformTx,
@@ -199,7 +207,9 @@ func main() {
 		bt.TransformUncle,
 		bt.TransformWithdrawals,
 		bt.TransformEnsNameRegistered,
-		bt.TransformContract)
+		bt.TransformContract,
+		bt.TransformConsolidationRequests,
+		bt.TransformWithdrawalRequests)
 
 	cache := freecache.NewCache(100 * 1024 * 1024) // 100 MB limit
 

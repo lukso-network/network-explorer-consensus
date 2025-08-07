@@ -305,13 +305,27 @@ func createMenuItems(active string, isMain bool) []types.MainMenuItem {
 					Links: []types.NavigationLink{
 						{
 							Label: "API Docs",
-							Path:  "/api/v1/docs/index.html",
+							Path:  "/api/v1/docs",
 							Icon:  "fa-book-reader",
 						},
 						{
 							Label: "Broadcast Signed Messages",
 							Path:  "/tools/broadcast",
 							Icon:  "fa-bullhorn",
+						},
+					},
+				}, {
+					Label: "Services",
+					Links: []types.NavigationLink{
+						{
+							Label: "LUKSO Clients",
+							Path:  "https://docs.lukso.tech/networks/mainnet/running-a-node#supported-clients-versions",
+							Icon:  "fa-desktop",
+						},
+						{
+							Label: "Slot Finder",
+							Path:  "/slots/finder",
+							Icon:  "fa-cube",
 						},
 					},
 				},
@@ -425,6 +439,11 @@ func createMenuItemsGnosis(active string, isMain bool) []types.MainMenuItem {
 					Label: "Stats",
 					Links: []types.NavigationLink{
 						{
+							Label: "Income History",
+							Path:  "/rewards",
+							Icon:  "fa-money-bill-alt",
+						},
+						{
 							Label: "Block Viz",
 							Path:  "/vis",
 							Icon:  "fa-project-diagram",
@@ -436,7 +455,7 @@ func createMenuItemsGnosis(active string, isMain bool) []types.MainMenuItem {
 					Links: []types.NavigationLink{
 						{
 							Label: "API Docs",
-							Path:  "/api/v1/docs/index.html",
+							Path:  "/api/v1/docs",
 							Icon:  "fa-book-reader",
 						},
 						{

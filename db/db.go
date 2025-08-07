@@ -2,11 +2,13 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net"
 	"regexp"
@@ -19,12 +21,13 @@ import (
 	"github.com/gobitfly/eth2-beaconchain-explorer/types"
 	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
+	_ "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 	"github.com/pressly/goose/v3"
-	prysm_deposit "github.com/prysmaticlabs/prysm/v3/contracts/deposit"
-	ethpb "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
+	prysm_deposit "github.com/prysmaticlabs/prysm/v5/contracts/deposit"
+	ethpb "github.com/prysmaticlabs/prysm/v5/proto/prysm/v1alpha1"
 	"github.com/sirupsen/logrus"
 
 	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
@@ -37,9 +40,21 @@ var EmbedMigrations embed.FS
 
 var DBPGX *pgxpool.Conn
 
+type SQLReaderDb interface {
+	Close() error
+	Get(dest interface{}, query string, args ...interface{}) error
+	Select(dest interface{}, query string, args ...interface{}) error
+	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	Query(query string, args ...any) (*sql.Rows, error)
+	Preparex(query string) (*sqlx.Stmt, error)
+	Rebind(query string) string
+}
+
 // DB is a pointer to the explorer-database
 var WriterDb *sqlx.DB
-var ReaderDb *sqlx.DB
+var ReaderDb SQLReaderDb
+
+var ClickhouseReaderDb *sqlx.DB
 
 var logger = logrus.StandardLogger().WithField("module", "db")
 
@@ -73,83 +88,96 @@ func dbTestConnection(dbConn *sqlx.DB, dataBaseName string) {
 }
 
 func mustInitDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig, driverName string, databaseBrand string) (*sqlx.DB, *sqlx.DB) {
-	if writer.MaxOpenConns == 0 {
-		writer.MaxOpenConns = 50
-	}
-	if writer.MaxIdleConns == 0 {
-		writer.MaxIdleConns = 10
-	}
-	if writer.MaxOpenConns < writer.MaxIdleConns {
-		writer.MaxIdleConns = writer.MaxOpenConns
+	if writer == nil && reader == nil {
+		logger.Fatal("no database configuration provided", 0)
 	}
 
-	if reader.MaxOpenConns == 0 {
-		reader.MaxOpenConns = 50
-	}
-	if reader.MaxIdleConns == 0 {
-		reader.MaxIdleConns = 10
-	}
-	if reader.MaxOpenConns < reader.MaxIdleConns {
-		reader.MaxIdleConns = reader.MaxOpenConns
-	}
-
-	var sslParam string
-	if driverName == "clickhouse" {
-		sslParam = "secure=false"
-		if writer.SSL {
-			sslParam = "secure=true"
+	var dbConnWriter, dbConnReader *sqlx.DB
+	var err error
+	if writer != nil {
+		sslParam := ""
+		if driverName == "clickhouse" {
+			sslParam = "secure=false"
+			if writer.SSL {
+				sslParam = "secure=true"
+			}
+			// debug
+			// sslParam += "&debug=true"
+		} else {
+			sslParam = "sslmode=disable"
+			if writer.SSL {
+				sslParam = "sslmode=require"
+			}
 		}
-		// debug
-		// sslParam += "&debug=true"
-	} else {
-		sslParam = "sslmode=disable"
-		if writer.SSL {
-			sslParam = "sslmode=require"
+		if writer.MaxOpenConns == 0 {
+			writer.MaxOpenConns = 50
 		}
-	}
+		if writer.MaxIdleConns == 0 {
+			writer.MaxIdleConns = 10
+		}
+		if writer.MaxOpenConns < writer.MaxIdleConns {
+			writer.MaxIdleConns = writer.MaxOpenConns
+		}
 
-	logger.Infof("connecting to %s database %s:%s/%s as writer with %d/%d max open/idle connections", databaseBrand, writer.Host, writer.Port, writer.Name, writer.MaxOpenConns, writer.MaxIdleConns)
-	dbConnWriter, err := sqlx.Open(driverName, fmt.Sprintf("%s://%s:%s@%s/%s?%s", databaseBrand, writer.Username, writer.Password, net.JoinHostPort(writer.Host, writer.Port), writer.Name, sslParam))
-	if err != nil {
-		logger.Fatal(err, "error getting Connection Writer database", 0)
-	}
+		logger.Infof("connecting to %s database %s:%s/%s as writer with %d/%d max open/idle connections", databaseBrand, writer.Host, writer.Port, writer.Name, writer.MaxOpenConns, writer.MaxIdleConns)
+		dbConnWriter, err = sqlx.Open(driverName, fmt.Sprintf("%s://%s:%s@%s/%s?%s", databaseBrand, writer.Username, writer.Password, net.JoinHostPort(writer.Host, writer.Port), writer.Name, sslParam))
+		if err != nil {
+			logger.Fatal(err, "error getting Connection Writer database", 0)
+		}
 
-	dbTestConnection(dbConnWriter, fmt.Sprintf("database %v:%v/%v", writer.Host, writer.Port, writer.Name))
-	dbConnWriter.SetConnMaxIdleTime(time.Second * 30)
-	dbConnWriter.SetConnMaxLifetime(time.Minute)
-	dbConnWriter.SetMaxOpenConns(writer.MaxOpenConns)
-	dbConnWriter.SetMaxIdleConns(writer.MaxIdleConns)
+		dbTestConnection(dbConnWriter, fmt.Sprintf("database %v:%v/%v", writer.Host, writer.Port, writer.Name))
+		dbConnWriter.SetConnMaxIdleTime(time.Second * 30)
+		dbConnWriter.SetConnMaxLifetime(time.Minute)
+		dbConnWriter.SetMaxOpenConns(writer.MaxOpenConns)
+		dbConnWriter.SetMaxIdleConns(writer.MaxIdleConns)
+	}
 
 	if reader == nil {
 		return dbConnWriter, dbConnWriter
 	}
 
-	if driverName == "clickhouse" {
-		sslParam = "secure=false"
-		if writer.SSL {
-			sslParam = "secure=true"
+	if reader != nil {
+		sslParam := ""
+		if driverName == "clickhouse" {
+			sslParam = "secure=false"
+			if reader.SSL {
+				sslParam = "secure=true"
+			}
+			// debug
+			// sslParam += "&debug=true"
+		} else {
+			sslParam = "sslmode=disable"
+			if reader.SSL {
+				sslParam = "sslmode=require"
+			}
 		}
-		// debug
-		// sslParam += "&debug=true"
-	} else {
-		sslParam = "sslmode=disable"
-		if writer.SSL {
-			sslParam = "sslmode=require"
+		if reader.MaxOpenConns == 0 {
+			reader.MaxOpenConns = 50
 		}
-	}
+		if reader.MaxIdleConns == 0 {
+			reader.MaxIdleConns = 10
+		}
+		if reader.MaxOpenConns < reader.MaxIdleConns {
+			reader.MaxIdleConns = reader.MaxOpenConns
+		}
 
-	logger.Infof("connecting to %s database %s:%s/%s as reader with %d/%d max open/idle connections", databaseBrand, reader.Host, reader.Port, reader.Name, reader.MaxOpenConns, reader.MaxIdleConns)
-	dbConnReader, err := sqlx.Open(driverName, fmt.Sprintf("%s://%s:%s@%s/%s?%s", databaseBrand, reader.Username, reader.Password, net.JoinHostPort(reader.Host, reader.Port), reader.Name, sslParam))
-	if err != nil {
-		logger.Fatal(err, "error getting Connection Reader database", 0)
-	}
+		logger.Infof("connecting to %s database %s:%s/%s as reader with %d/%d max open/idle connections", databaseBrand, reader.Host, reader.Port, reader.Name, reader.MaxOpenConns, reader.MaxIdleConns)
+		dbConnReader, err = sqlx.Open(driverName, fmt.Sprintf("%s://%s:%s@%s/%s?%s", databaseBrand, reader.Username, reader.Password, net.JoinHostPort(reader.Host, reader.Port), reader.Name, sslParam))
+		if err != nil {
+			logger.Fatal(err, "error getting Connection Reader database", 0)
+		}
 
-	dbTestConnection(dbConnReader, fmt.Sprintf("database %v:%v/%v", writer.Host, writer.Port, writer.Name))
-	dbConnReader.SetConnMaxIdleTime(time.Second * 30)
-	dbConnReader.SetConnMaxLifetime(time.Minute)
-	dbConnReader.SetMaxOpenConns(reader.MaxOpenConns)
-	dbConnReader.SetMaxIdleConns(reader.MaxIdleConns)
+		dbTestConnection(dbConnReader, fmt.Sprintf("database %v:%v/%v", reader.Host, reader.Port, reader.Name))
+		dbConnReader.SetConnMaxIdleTime(time.Second * 30)
+		dbConnReader.SetConnMaxLifetime(time.Minute)
+		dbConnReader.SetMaxOpenConns(reader.MaxOpenConns)
+		dbConnReader.SetMaxIdleConns(reader.MaxIdleConns)
+	}
 	return dbConnWriter, dbConnReader
+}
+
+func MustInitClickhouseDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig, driverName string, databaseBrand string) {
+	_, ClickhouseReaderDb = mustInitDB(writer, reader, driverName, databaseBrand)
 }
 
 func MustInitDB(writer *types.DatabaseConfig, reader *types.DatabaseConfig, driverName string, databaseBrand string) {
@@ -180,7 +208,7 @@ func ApplyEmbeddedDbSchema(version int64) error {
 	return nil
 }
 
-func GetEth1DepositsJoinEth2Deposits(query string, length, start uint64, orderBy, orderDir string, latestEpoch, validatorOnlineThresholdSlot uint64) ([]*types.EthOneDepositsData, uint64, error) {
+func GetEth1DepositsJoinEth2Deposits(query string, length, start uint64, orderDir string, latestEpoch, validatorOnlineThresholdSlot uint64) ([]*types.EthOneDepositsData, uint64, error) {
 	// Initialize the return values
 	deposits := []*types.EthOneDepositsData{}
 	totalCount := uint64(0)
@@ -188,17 +216,7 @@ func GetEth1DepositsJoinEth2Deposits(query string, length, start uint64, orderBy
 	if orderDir != "desc" && orderDir != "asc" {
 		orderDir = "desc"
 	}
-	columns := []string{"tx_hash", "tx_input", "tx_index", "block_number", "block_ts", "from_address", "publickey", "withdrawal_credentials", "amount", "signature", "merkletree_index", "state", "valid_signature"}
-	hasColumn := false
-	for _, column := range columns {
-		if orderBy == column {
-			hasColumn = true
-			break
-		}
-	}
-	if !hasColumn {
-		orderBy = "block_ts"
-	}
+	orderBy := "block_ts"
 
 	var param interface{}
 	var searchQuery string
@@ -362,7 +380,7 @@ func GetEth1DepositsLeaderboard(query string, length, start uint64, orderBy, ord
 	return deposits, totalCount, nil
 }
 
-func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir string) ([]*types.EthTwoDepositData, uint64, error) {
+func GetEth2Deposits(query string, length, start uint64, orderDir string) ([]*types.EthTwoDepositData, uint64, error) {
 	// Initialize the return values
 	deposits := []*types.EthTwoDepositData{}
 	totalCount := uint64(0)
@@ -370,30 +388,16 @@ func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir strin
 	if orderDir != "desc" && orderDir != "asc" {
 		orderDir = "desc"
 	}
-	columns := []string{"block_slot", "publickey", "amount", "withdrawalcredentials", "signature"}
-	hasColumn := false
-	for _, column := range columns {
-		if orderBy == column {
-			hasColumn = true
-			break
-		}
-	}
-	if !hasColumn {
-		orderBy = "block_slot"
-	}
+	orderBy := "block_slot"
 
 	var param interface{}
 	var searchQuery string
 	var err error
 
 	// Define the base queries
-	deposistsCountQuery := `
-		SELECT COUNT(*)
-		FROM blocks_deposits
-		INNER JOIN blocks ON blocks_deposits.block_root = blocks.blockroot AND blocks.status = '1'
-		%s`
+	depositsCountQuery := `SELECT COALESCE(SUM(depositscount),0) FROM blocks WHERE status = '1' AND depositscount > 0`
 
-	deposistsQuery := `
+	depositsQuery := `
 			SELECT 
 				blocks_deposits.block_slot,
 				blocks_deposits.block_index,
@@ -419,14 +423,14 @@ func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir strin
 		}
 	}
 	if trimmedQuery == "" {
-		err = ReaderDb.Get(&totalCount, fmt.Sprintf(deposistsCountQuery, ""))
+		err = ReaderDb.Get(&totalCount, depositsCountQuery)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("error getting totalCount without search: %w", err)
 		}
 
-		err = ReaderDb.Select(&deposits, fmt.Sprintf(deposistsQuery, "", orderBy, orderDir), length, start)
+		err = ReaderDb.Select(&deposits, fmt.Sprintf(depositsQuery, "", orderBy, orderDir), length, start)
 		if err != nil && err != sql.ErrNoRows {
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("error selecting deposits without search: %w", err)
 		}
 
 		return deposits, totalCount, nil
@@ -435,33 +439,49 @@ func GetEth2Deposits(query string, length, start uint64, orderBy, orderDir strin
 	if utils.IsHash(trimmedQuery) {
 		param = hash
 		searchQuery = `WHERE blocks_deposits.publickey = $3`
+		depositsCountQuery = `
+			SELECT COALESCE(SUM(depositscount),0)
+			FROM blocks
+			INNER JOIN blocks_deposits ON blocks.blockroot = blocks_deposits.block_root AND blocks_deposits.publickey = $1
+			WHERE status = '1' AND depositscount > 0`
 	} else if utils.IsValidWithdrawalCredentials(trimmedQuery) {
 		param = hash
 		searchQuery = `WHERE blocks_deposits.withdrawalcredentials = $3`
+		depositsCountQuery = `
+			SELECT COALESCE(SUM(depositscount),0)
+			FROM blocks
+			INNER JOIN blocks_deposits ON blocks.blockroot = blocks_deposits.block_root AND blocks_deposits.withdrawalcredentials = $1
+			WHERE status = '1' AND depositscount > 0`
 	} else if utils.IsEth1Address(trimmedQuery) {
 		param = hash
 		searchQuery = `
-				LEFT JOIN eth1_deposits ON blocks_deposits.publickey = eth1_deposits.publickey
-				WHERE eth1_deposits.from_address = $3`
+			LEFT JOIN eth1_deposits ON blocks_deposits.publickey = eth1_deposits.publickey
+			WHERE eth1_deposits.from_address = $3`
+		depositsCountQuery = `
+			SELECT COUNT(*) FROM blocks_deposits 
+			INNER JOIN blocks ON blocks_deposits.block_root = blocks.blockroot AND blocks.status = '1'
+			LEFT JOIN eth1_deposits ON blocks_deposits.publickey = eth1_deposits.publickey
+			WHERE eth1_deposits.from_address = $1`
 	} else if uiQuery, parseErr := strconv.ParseUint(query, 10, 31); parseErr == nil { // Limit to 31 bits to stay within math.MaxInt32
 		param = uiQuery
 		searchQuery = `WHERE blocks_deposits.block_slot = $3`
+		depositsCountQuery = `
+			SELECT COALESCE(SUM(depositscount),0)
+			FROM blocks
+			WHERE status = '1' AND depositscount > 0 AND slot = $1`
 	} else {
 		// The query does not fulfill any of the requirements for a search
 		return deposits, totalCount, nil
 	}
 
-	// The deposits count query only has one parameter for the search
-	countSearchQuery := strings.ReplaceAll(searchQuery, "$3", "$1")
-
-	err = ReaderDb.Get(&totalCount, fmt.Sprintf(deposistsCountQuery, countSearchQuery), param)
-	if err != nil {
-		return nil, 0, err
+	err = ReaderDb.Get(&totalCount, depositsCountQuery, param)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, 0, fmt.Errorf("error getting totalCount: %w", err)
 	}
 
-	err = ReaderDb.Select(&deposits, fmt.Sprintf(deposistsQuery, searchQuery, orderBy, orderDir), length, start, param)
+	err = ReaderDb.Select(&deposits, fmt.Sprintf(depositsQuery, searchQuery, orderBy, orderDir), length, start, param)
 	if err != nil && err != sql.ErrNoRows {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("error selecting deposits: %w", err)
 	}
 
 	return deposits, totalCount, nil
@@ -573,6 +593,23 @@ func GetValidatorIndex(publicKey []byte) (uint64, error) {
 	return index, err
 }
 
+func GetNextPendingDeposit(pubkey []byte) (*types.PendingDeposit, error) {
+	entry, err := GetPendingDeposits(pubkey, 1)
+	if len(entry) == 0 {
+		return &types.PendingDeposit{}, sql.ErrNoRows
+	}
+	return &entry[0], err
+}
+
+func GetPendingDeposits(pubkey []byte, limit int) ([]types.PendingDeposit, error) {
+	var pendingDeposit []types.PendingDeposit
+	err := ReaderDb.Select(&pendingDeposit, `SELECT id, est_clear_epoch, amount, withdrawal_credentials, signature FROM pending_deposits_queue WHERE pubkey = $1 ORDER BY id asc LIMIT $2`, pubkey, limit)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	return pendingDeposit, err
+}
+
 // GetValidatorDeposits will return eth1- and eth2-deposits for a public key from the database
 func GetValidatorDeposits(publicKey []byte) (*types.ValidatorDeposits, error) {
 	deposits := &types.ValidatorDeposits{}
@@ -612,11 +649,45 @@ func GetValidatorDeposits(publicKey []byte) (*types.ValidatorDeposits, error) {
 			blocks_deposits.signature
 		FROM blocks_deposits
 		INNER JOIN blocks ON (blocks_deposits.block_root = blocks.blockroot AND blocks.status = '1') OR (blocks_deposits.block_slot = 0 AND blocks_deposits.block_slot = blocks.slot AND blocks_deposits.publickey = $1)
-		WHERE blocks_deposits.publickey = $1`, publicKey)
+		WHERE blocks_deposits.publickey = $1
+		UNION ALL
+		SELECT
+			blocks_deposit_requests_v2.slot_processed as block_slot,
+			blocks_deposit_requests_v2.index_processed as request_index,
+			blocks_deposit_requests_v2.block_processed_root as block_root,
+			null,
+			blocks_deposit_requests_v2.pubkey,
+			blocks_deposit_requests_v2.withdrawal_credentials,
+			blocks_deposit_requests_v2.amount,
+			blocks_deposit_requests_v2.signature
+		FROM blocks_deposit_requests_v2
+		INNER JOIN blocks ON (blocks_deposit_requests_v2.block_processed_root = blocks.blockroot AND blocks.status = '1') OR (blocks_deposit_requests_v2.slot_processed = 0 AND blocks_deposit_requests_v2.slot_processed = blocks.slot AND blocks_deposit_requests_v2.pubkey = $1)
+		WHERE blocks_deposit_requests_v2.pubkey = $1
+		AND blocks_deposit_requests_v2.status = 'completed'
+		ORDER BY block_slot DESC, block_index DESC
+		`, publicKey)
 	if err != nil {
 		return nil, err
 	}
-	return deposits, nil
+
+	pendingDeposits, err := GetPendingDeposits(publicKey, 10)
+	if err == nil {
+		deposits.PendingEth2Deposits = make([]types.Eth2Deposit, 0, len(pendingDeposits))
+		for _, deposit := range pendingDeposits {
+			deposits.PendingEth2Deposits = append(deposits.PendingEth2Deposits, types.Eth2Deposit{
+				BlockSlot:             deposit.EstClearEpoch * utils.Config.ClConfig.SlotsPerEpoch,
+				BlockIndex:            0,
+				BlockRoot:             nil,
+				Proof:                 nil,
+				Publickey:             publicKey,
+				Withdrawalcredentials: deposit.WithdrawalCredentials,
+				Amount:                deposit.Amount,
+				Signature:             deposit.Signature,
+			})
+		}
+	}
+
+	return utils.FixELDepositValidity(deposits), nil
 }
 
 // UpdateCanonicalBlocks will update the blocks for an epoch range in the database
@@ -989,6 +1060,8 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 		return fmt.Errorf("error preparing insert validator statement: %w", err)
 	}
 
+	validatorStatusCounts := make(map[string]int)
+
 	updates := 0
 	for _, v := range validators {
 
@@ -1031,6 +1104,7 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 			if err != nil {
 				logger.Errorf("error saving new validator %v: %v", v.Index, err)
 			}
+			validatorStatusCounts[v.Status]++
 		} else {
 			// status                     =
 			// CASE
@@ -1071,6 +1145,7 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 				v.Status = "active_online"
 			}
 
+			validatorStatusCounts[v.Status]++
 			if c.Status != v.Status {
 				logger.Tracef("Status changed for validator %v from %v to %v", v.Index, c.Status, v.Status)
 				// logger.Tracef("v.ActivationEpoch %v, latestEpoch %v, lastAttestationSlots[v.Index] %v, thresholdSlot %v", v.ActivationEpoch, latestEpoch, lastAttestationSlots[v.Index], thresholdSlot)
@@ -1198,6 +1273,20 @@ func SaveValidators(epoch uint64, validators []*types.Validator, client rpc.Clie
 	}
 
 	logger.Infof("updating validator activation epoch balance completed, took %v", time.Since(s))
+
+	logger.Infof("updating validator status counts")
+	s = time.Now()
+	_, err = tx.Exec("TRUNCATE TABLE validators_status_counts;")
+	if err != nil {
+		return fmt.Errorf("error truncating validators_status_counts table: %w", err)
+	}
+	for status, count := range validatorStatusCounts {
+		_, err = tx.Exec("INSERT INTO validators_status_counts (status, validator_count) VALUES ($1, $2);", status, count)
+		if err != nil {
+			return fmt.Errorf("error updating validator status counts: %w", err)
+		}
+	}
+	logger.Infof("updating validator status counts completed, took %v", time.Since(s))
 
 	s = time.Now()
 	_, err = tx.Exec("ANALYZE (SKIP_LOCKED) validators;")
@@ -1767,12 +1856,13 @@ func GetQueueAheadOfValidator(validatorIndex uint64) (uint64, error) {
 	return res, err
 }
 
-func GetValidatorNames() (map[uint64]string, error) {
+func GetValidatorNames(validators []uint64) (map[uint64]string, error) {
+	logger.Infof("getting validator names for %d validators", len(validators))
 	rows, err := ReaderDb.Query(`
 		SELECT validatorindex, validator_names.name 
 		FROM validators 
 		LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-		WHERE validator_names.name IS NOT NULL`)
+		WHERE validators.validatorindex = ANY($1) AND validator_names.name IS NOT NULL`, pq.Array(validators))
 
 	if err != nil {
 		return nil, err
@@ -1797,6 +1887,7 @@ func GetValidatorNames() (map[uint64]string, error) {
 }
 
 // GetPendingValidatorCount queries the pending validators currently in the queue
+// @deprecated after pectra, use services.LatestQueueData instead
 func GetPendingValidatorCount() (uint64, error) {
 	count := uint64(0)
 	err := ReaderDb.Get(&count, "SELECT entering_validators_count FROM queue ORDER BY ts DESC LIMIT 1")
@@ -1810,7 +1901,7 @@ func GetTotalEligibleEther() (uint64, error) {
 	var total uint64
 
 	err := ReaderDb.Get(&total, `
-		SELECT eligibleether FROM epochs ORDER BY epoch DESC LIMIT 1
+		SELECT (eligibleether / 1e9)::int FROM epochs ORDER BY epoch DESC LIMIT 1
 	`)
 	if err == sql.ErrNoRows {
 		return 0, nil
@@ -1818,7 +1909,7 @@ func GetTotalEligibleEther() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return total / 1e9, nil
+	return total, nil
 }
 
 // GetValidatorsGotSlashed returns the validators that got slashed after `epoch` either by an attestation violation or a proposer violation
@@ -2230,10 +2321,9 @@ func GetTotalAmountWithdrawn() (sum uint64, count uint64, err error) {
 func GetTotalAmountDeposited() (uint64, error) {
 	var total uint64
 	err := ReaderDb.Get(&total, `
-	SELECT 
-		COALESCE(sum(d.amount), 0) as sum 
-	FROM blocks_deposits d
-	INNER JOIN blocks b ON b.blockroot = d.block_root AND b.status = '1'`)
+	SELECT COALESCE(sum(d.amount), 0) as sum 
+	FROM blocks_deposits d 
+	INNER JOIN blocks b ON b.slot = d.block_slot AND b.blockroot = d.block_root WHERE b.status = '1' AND b.depositscount > 0;`)
 	return total, err
 }
 
@@ -2295,10 +2385,14 @@ func GetAddressWithdrawalTableData(address []byte, pageToken string, currency st
 		}
 	}
 
+	// Note that withdrawalindex can be negative in the table starting with pectra.
+	// To keep API compatability we use the GREATEST function.
+	// pagination should not be affected as there is only one withdrawal for a given address at a time.
+
 	err = ReaderDb.Select(&withdrawals, `
 	SELECT 
 		w.block_slot as slot, 
-		w.withdrawalindex as index, 
+		GREATEST(withdrawalindex, 0) as index, 
 		w.validatorindex, 
 		w.address, 
 		w.amount 
@@ -2404,7 +2498,7 @@ func GetValidatorsWithdrawals(validators []uint64, fromEpoch uint64, toEpoch uin
 		w.amount 
 	FROM blocks_withdrawals w
 	INNER JOIN blocks b ON b.blockroot = w.block_root AND b.status = '1'
-	WHERE validatorindex = ANY($1)
+	WHERE validatorindex = ANY($1) AND w.address <> ''::bytea
 	AND (w.block_slot / $4) >= $2 AND (w.block_slot / $4) <= $3 
 	ORDER BY w.withdrawalindex`, pq.Array(validators), fromEpoch, toEpoch, utils.Config.Chain.ClConfig.SlotsPerEpoch)
 	if err != nil {
@@ -3001,7 +3095,13 @@ func GetWithdrawableValidatorCount(epoch uint64) (uint64, error) {
         WHERE DAY = (SELECT COALESCE(MAX(day), 0) FROM validator_stats_status)) as stats 
 	ON stats.validatorindex = validators.validatorindex
 	WHERE 
-		validators.withdrawalcredentials LIKE '\x01' || '%'::bytea AND ((stats.end_effective_balance = $1 AND stats.end_balance > $1) OR (validators.withdrawableepoch <= $2 AND stats.end_balance > 0));`, utils.Config.Chain.ClConfig.MaxEffectiveBalance, epoch)
+    (
+        (get_byte(validators.withdrawalcredentials, 0) = 1 AND stats.end_effective_balance = $1 AND stats.end_balance > $1)
+        OR
+        (get_byte(validators.withdrawalcredentials, 0) = 2 AND stats.end_effective_balance = $3 AND stats.end_balance > $3)
+        OR
+        (validators.withdrawableepoch <= $2 AND stats.end_balance > 0)
+    )`, utils.Config.Chain.ClConfig.MaxEffectiveBalance, epoch, utils.Config.Chain.ClConfig.MaxEffectiveBalanceElectra)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return 0, nil
@@ -3065,15 +3165,168 @@ func GetValidatorIncomePerformance(validators []uint64, incomePerformance *types
 		WHERE validatorindex = ANY($1)`, validatorsPQArray)
 }
 
-func GetTotalValidatorDeposits(validators []uint64, totalDeposits *uint64) error {
+type SlotRange struct {
+	StartSlot uint64
+	EndSlot   uint64
+}
+
+type GetValidatorDepositsAndIncomingConsolidationsResult struct {
+	ValidatorIndex uint64 `db:"validatorindex"`
+	Deposits       uint64 `db:"deposits"`
+	DepositsAmount uint64 `db:"deposits_amount"`
+}
+
+func GetValidatorDepositsAndIncomingConsolidations(slotRange *SlotRange, validators []uint64) ([]*GetValidatorDepositsAndIncomingConsolidationsResult, error) {
+	if validators == nil {
+		validators = []uint64{}
+	}
 	validatorsPQArray := pq.Array(validators)
-	return ReaderDb.Get(totalDeposits, `
-		SELECT 
-			COALESCE(SUM(amount), 0) 
-		FROM blocks_deposits d
-		INNER JOIN blocks b ON b.blockroot = d.block_root AND b.status = '1' 
-		WHERE publickey IN (SELECT pubkey FROM validators WHERE validatorindex = ANY($1))
-	`, validatorsPQArray)
+
+	if slotRange == nil {
+		slotRange = &SlotRange{
+			StartSlot: 0,
+			EndSlot:   uint64(math.MaxInt32),
+		}
+	}
+
+	ret := []*GetValidatorDepositsAndIncomingConsolidationsResult{}
+
+	depositsQry := `
+			SELECT 
+				validatorindex, 
+				COUNT(*) AS deposits, 
+				SUM(amount) AS deposits_amount
+			FROM (
+				SELECT
+					validators.validatorindex,
+					amount
+				FROM
+					blocks_deposits
+					INNER JOIN validators ON blocks_deposits.publickey = validators.pubkey
+					INNER JOIN blocks ON blocks_deposits.block_root = blocks.blockroot
+				where
+					blocks.slot >= $1
+					AND blocks.slot <= $2
+					AND (
+						blocks.status = '1'
+						OR blocks.slot = 0
+					)
+					AND blocks_deposits.valid_signature
+					AND (cardinality($3::int[]) = 0 OR validators.validatorindex = ANY($3))
+				UNION ALL
+				SELECT
+					validators.validatorindex,
+					amount
+				FROM
+					blocks_deposit_requests_v2
+					INNER JOIN validators ON blocks_deposit_requests_v2.pubkey = validators.pubkey
+					INNER JOIN blocks ON blocks_deposit_requests_v2.block_processed_root = blocks.blockroot
+				WHERE
+					blocks.slot >= $1
+					AND blocks.slot <= $2
+					AND (
+						blocks.status = '1'
+						OR blocks.slot = 0
+					)
+					AND blocks_deposit_requests_v2.status = 'completed'
+					AND (cardinality($3::int[]) = 0 OR validators.validatorindex = ANY($3))
+				UNION ALL
+				SELECT
+					validators.validatorindex as target_index,
+					amount_consolidated
+				FROM
+					blocks_consolidation_requests_v2
+					INNER JOIN validators ON blocks_consolidation_requests_v2.target_pubkey = validators.pubkey
+					INNER JOIN blocks ON blocks_consolidation_requests_v2.block_processed_root = blocks.blockroot
+				WHERE
+					blocks.slot >= $1
+					AND blocks.slot <= $2
+					AND (
+						blocks.status = '1'
+						OR blocks.slot = 0
+					)
+					AND blocks_consolidation_requests_v2.status = 'completed'
+					AND (cardinality($3::int[]) = 0 OR validators.validatorindex = ANY($3))
+			) AS a
+			GROUP BY validatorindex
+			ORDER BY 2 DESC;`
+
+	err := WriterDb.Select(&ret, depositsQry, slotRange.StartSlot, slotRange.EndSlot, validatorsPQArray)
+
+	if err != nil {
+		return nil, fmt.Errorf("error getting validator deposits and incoming consolidations: %w", err)
+	}
+	return ret, nil
+}
+
+type GetValidatorWithdrawalsAndOutgoingConsolidationsResult struct {
+	ValidatorIndex    uint64 `db:"validatorindex"`
+	Withdrawals       uint64 `db:"withdrawals"`
+	WithdrawalsAmount uint64 `db:"withdrawals_amount"`
+}
+
+func GetValidatorWithdrawalsAndOutgoingConsolidations(slotRange *SlotRange, validators []uint64) ([]*GetValidatorWithdrawalsAndOutgoingConsolidationsResult, error) {
+	if validators == nil {
+		validators = []uint64{}
+	}
+	validatorsPQArray := pq.Array(validators)
+
+	if slotRange == nil {
+		slotRange = &SlotRange{
+			StartSlot: 0,
+			EndSlot:   uint64(math.MaxInt32),
+		}
+	}
+
+	ret := []*GetValidatorWithdrawalsAndOutgoingConsolidationsResult{}
+
+	query := `
+		SELECT
+			validatorindex,
+			COUNT(*) AS withdrawals,
+			SUM(amount) AS withdrawals_amount
+		FROM
+			(
+				SELECT
+					validatorindex,
+					amount
+				FROM
+					blocks_withdrawals
+					INNER JOIN blocks on blocks_withdrawals.block_root = blocks.blockroot
+				WHERE
+					block_slot >= $1
+					AND block_slot <= $2
+					AND blocks.status = '1'
+					AND (cardinality($3::int[]) = 0 OR blocks_withdrawals.validatorindex = ANY($3))
+				UNION ALL
+				SELECT
+					validators.validatorindex as source_index,
+					amount_consolidated
+				FROM
+					blocks_consolidation_requests_v2
+					INNER JOIN validators ON blocks_consolidation_requests_v2.source_pubkey = validators.pubkey
+					INNER JOIN blocks ON blocks_consolidation_requests_v2.block_processed_root = blocks.blockroot
+				WHERE
+					slot_processed >= $1
+					AND slot_processed <= $2
+					AND blocks_consolidation_requests_v2.amount_consolidated > 0
+					AND (
+						blocks.status = '1'
+						OR blocks.slot = 0
+					)
+					AND blocks_consolidation_requests_v2.status = 'completed'
+					AND (cardinality($3::int[]) = 0 OR validators.validatorindex = ANY($3))
+			) AS a
+		GROUP BY
+			validatorindex;
+	`
+
+	err := WriterDb.Select(&ret, query, slotRange.StartSlot, slotRange.EndSlot, validatorsPQArray)
+
+	if err != nil {
+		return nil, fmt.Errorf("error getting validator withdrawals and outgoing consolidations: %w", err)
+	}
+	return ret, nil
 }
 
 func GetFirstActivationEpoch(validators []uint64, firstActivationEpoch *uint64) error {
@@ -3085,17 +3338,6 @@ func GetFirstActivationEpoch(validators []uint64, firstActivationEpoch *uint64) 
 		WHERE validatorindex = ANY($1) 
 		ORDER BY activationepoch LIMIT 1
 	`, validatorsPQArray)
-}
-
-func GetValidatorDepositsForSlots(validators []uint64, fromSlot uint64, toSlot uint64, deposits *uint64) error {
-	validatorsPQArray := pq.Array(validators)
-	return ReaderDb.Get(deposits, `
-		SELECT 
-			COALESCE(SUM(amount), 0) 
-		FROM blocks_deposits d
-		INNER JOIN blocks b ON b.blockroot = d.block_root AND b.status = '1' and b.slot >= $2 and b.slot <= $3
-		WHERE publickey IN (SELECT pubkey FROM validators WHERE validatorindex = ANY($1))
-	`, validatorsPQArray, fromSlot, toSlot)
 }
 
 func GetValidatorWithdrawalsForSlots(validators []uint64, fromSlot uint64, toSlot uint64, withdrawals *uint64) error {
