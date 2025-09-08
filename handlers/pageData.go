@@ -295,6 +295,11 @@ func createMenuItems(active string, isMain bool) []types.MainMenuItem {
 					Label: "Stats",
 					Links: []types.NavigationLink{
 						{
+							Label: "Income History",
+							Path:  "/rewards",
+							Icon:  "fa-money-bill-alt",
+						},
+						{
 							Label: "Block Viz",
 							Path:  "/vis",
 							Icon:  "fa-project-diagram",
@@ -318,9 +323,14 @@ func createMenuItems(active string, isMain bool) []types.MainMenuItem {
 					Label: "Services",
 					Links: []types.NavigationLink{
 						{
+							Label: "Knowledge Base",
+							Path:  "https://docs.lukso.tech/",
+							Icon:  "fa-external-link-alt",
+						},
+						{
 							Label: "LUKSO Clients",
 							Path:  "https://docs.lukso.tech/networks/mainnet/running-a-node#supported-clients-versions",
-							Icon:  "fa-desktop",
+							Icon:  "fa-external-link-alt",
 						},
 						{
 							Label: "Slot Finder",
@@ -462,6 +472,26 @@ func createMenuItemsGnosis(active string, isMain bool) []types.MainMenuItem {
 							Label: "Broadcast Signed Messages",
 							Path:  "/tools/broadcast",
 							Icon:  "fa-bullhorn",
+						},
+					},
+				},
+				{
+					Label: "Services",
+					Links: []types.NavigationLink{
+						{
+							Label: "Knowledge Base",
+							Path:  "https://docs.lukso.tech/",
+							Icon:  "fa-external-link-alt",
+						},
+						{
+							Label: "LUKSO Clients",
+							Path:  "https://docs.lukso.tech/networks/mainnet/running-a-node#supported-clients-versions",
+							Icon:  "fa-external-link-alt",
+						},
+						{
+							Label: "Slot Finder",
+							Path:  "/slots/finder",
+							Icon:  "fa-cube",
 						},
 					},
 				},
