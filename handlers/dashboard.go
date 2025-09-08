@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
 	"github.com/gobitfly/eth2-beaconchain-explorer/price"
 	"github.com/gobitfly/eth2-beaconchain-explorer/services"
 	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
@@ -294,13 +295,17 @@ func Dashboard(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html")
 
-	_, _, redirect, err := handleValidatorsQuery(w, r, false)
+	valiIndices, valiPubkeys, redirect, err := handleValidatorsQuery(w, r, false)
 	if err != nil || redirect {
 		return
 	}
 
+	// add a counter per 10 validators to the metrics to be able to track the number of dashboard requests per validator count in buckets of 10 validators
+	metrics.Counter.WithLabelValues(fmt.Sprintf("dashboard_requests_%d", int(math.Ceil(float64(len(valiIndices)+len(valiPubkeys))/10))*10)).Inc()
+
 	dashboardData := types.DashboardData{}
 	dashboardData.ValidatorLimit = getUserPremium(r).MaxValidators
+	dashboardData.ChainName = utils.Config.Chain.Name
 
 	epoch := services.LatestEpoch()
 	dashboardData.CappellaHasHappened = epoch >= (utils.Config.Chain.ClConfig.CappellaForkEpoch)
@@ -371,8 +376,9 @@ func getNextWithdrawalRow(queryValidators []uint64, currency string) ([][]interf
 			continue
 		}
 
+		maxEB := utils.GetMaxEffectiveBalanceByWithdrawalCredentials(v.WithdrawalCredentials)
 		if (balance[0].Balance > 0 && v.WithdrawableEpoch <= epoch) ||
-			(balance[0].EffectiveBalance == utils.Config.Chain.ClConfig.MaxEffectiveBalance && balance[0].Balance > utils.Config.Chain.ClConfig.MaxEffectiveBalance) {
+			(balance[0].EffectiveBalance == maxEB && balance[0].Balance > maxEB) {
 			// this validator is eligible for withdrawal, check if it is the next one
 			if nextValidator == nil || v.Index > *stats.LatestValidatorWithdrawalIndex {
 				nextValidator = v
@@ -420,16 +426,17 @@ func getNextWithdrawalRow(queryValidators []uint64, currency string) ([][]interf
 		withdrawalCredentialsTemplate = `<span class="text-muted">N/A</span>`
 	}
 
+	maxEB := utils.GetMaxEffectiveBalanceByWithdrawalCredentials(nextValidator.WithdrawalCredentials)
 	var withdrawalAmount uint64
 	if nextValidator.WithdrawableEpoch <= epoch {
 		// full withdrawal
 		withdrawalAmount = nextValidator.Balance
 	} else {
 		// partial withdrawal
-		withdrawalAmount = nextValidator.Balance - utils.Config.Chain.ClConfig.MaxEffectiveBalance
+		withdrawalAmount = nextValidator.Balance - maxEB
 	}
 
-	if lastWithdrawnEpoch == epoch || nextValidator.Balance < utils.Config.Chain.ClConfig.MaxEffectiveBalance {
+	if lastWithdrawnEpoch == epoch || nextValidator.Balance < maxEB {
 		withdrawalAmount = 0
 	}
 
@@ -438,7 +445,7 @@ func getNextWithdrawalRow(queryValidators []uint64, currency string) ([][]interf
 		utils.FormatValidator(nextValidator.Index),
 		template.HTML(fmt.Sprintf(`<span class="text-muted">~ %s</span>`, utils.FormatEpoch(uint64(utils.TimeToEpoch(timeToWithdrawal))))),
 		template.HTML(fmt.Sprintf(`<span class="text-muted">~ %s</span>`, utils.FormatBlockSlot(utils.TimeToSlot(uint64(timeToWithdrawal.Unix()))))),
-		template.HTML(fmt.Sprintf(`<span class="">~ %s</span>`, utils.FormatTimestamp(timeToWithdrawal.Unix()))),
+		template.HTML(fmt.Sprintf(`<span class="text-muted"><span data-toggle="tooltip" title="Due to uncertainty in execution-triggered withdrawals, your withdrawal may take up to twice the estimated time to process."><i class="far ml-1 fa-question-circle" style="margin-left: 0px !important;"></i></span> ~ %s</span>`, utils.FormatTimestamp(timeToWithdrawal.Unix()))),
 		withdrawalCredentialsTemplate,
 		template.HTML(fmt.Sprintf(`<span class="text-muted"><span data-toggle="tooltip" title="If the withdrawal were to be processed at this very moment, this amount would be withdrawn"><i class="far ml-1 fa-question-circle" style="margin-left: 0px !important;"></i></span> %s</span>`, utils.FormatClCurrency(withdrawalAmount, currency, 6, true, false, false, true))),
 	})
@@ -681,7 +688,7 @@ func DashboardDataWithdrawals(w http.ResponseWriter, r *http.Request) {
 			utils.FormatEpoch(utils.EpochOfSlot(w.Slot)),
 			utils.FormatBlockSlot(w.Slot),
 			utils.FormatTimestamp(utils.SlotToTime(w.Slot).Unix()),
-			utils.FormatAddress(w.Address, nil, "", false, false, true),
+			utils.FormatWithdrawalAddress(w.Address, nil, "", false, false, true),
 			utils.FormatClCurrency(w.Amount, reqCurrency, 6, true, false, false, true),
 		})
 	}

@@ -460,9 +460,13 @@
                   </div>
                   <div class="card-body">
                     <div class="d-flex justify-content-between">
-                      <span> Warning, you will not be able to recover your account! </span>
-                      <!-- Button trigger modal -->
-                      <button type="button" class="btn btn-sm btn-outline-danger" data-toggle="modal" data-target="#deleteAccountModal">Delete</button>
+                      {{ if .IsUserDeleteDisabled }}
+                        <span> You currently have an active premium subscription or premium API plan. To delete your account please cancel your subscription or contact our <a href="https://dsc.gg/beaconchain">support</a> </span>
+                      {{ else }}
+                        <span> Warning, you will not be able to recover your account! </span>
+                        <!-- Button trigger modal -->
+                        <button type="button" class="btn btn-sm btn-outline-danger" data-toggle="modal" data-target="#deleteAccountModal">Delete</button>
+                      {{ end }}
                     </div>
                   </div>
                 </div>
@@ -847,7 +851,7 @@
                     <div class="card-header justify-content-between d-flex align-items-center">
                       <h3 class="h5">
                         <span
-                          >Usage <span class="mx-1">|</span> <a style="font-size: 80%;" class="font-weight-light" href="/api/v1/docs/index.html">docs <i style="font-size: 80%;" class="fas fa-laptop-code"></i></a
+                          >Usage <span class="mx-1">|</span> <a style="font-size: 80%;" class="font-weight-light" href="/api/v1/docs">docs <i style="font-size: 80%;" class="fas fa-laptop-code"></i></a
                         ></span>
                       </h3>
                     </div>
