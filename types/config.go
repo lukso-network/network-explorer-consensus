@@ -139,6 +139,7 @@ type Chain struct {
 	ElConfig                                  *params.ChainConfig
 	PectraWithdrawalRequestContractAddress    string `yaml:"pectraWithdrawalRequestContractAddress" envconfig:"CHAIN_PECTRA_WITHDRAWAL_REQUEST_CONTRACT_ADDRESS"`
 	PectraConsolidationRequestContractAddress string `yaml:"pectraConsolidationRequestContractAddress" envconfig:"CHAIN_PECTRA_CONSOLIDATION_REQUEST_CONTRACT_ADDRESS"`
+	GenesisTotalSupply                        uint64 `yaml:"genesisTotalSupply" envconfig:"CHAIN_GENESIS_TOTAL_SUPPLY"`
 }
 
 type Bigtable struct {
